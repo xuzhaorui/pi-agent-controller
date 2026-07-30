@@ -15,6 +15,8 @@ The controller stops only for an explicit reason such as an empty backlog, a blo
 Specification stage. No implementation has been released yet.
 
 - [Product specification](docs/spec.md)
+- [Specification issue](https://github.com/xuzhaorui/pi-agent-controller/issues/1)
+- [Implementation issues](https://github.com/xuzhaorui/pi-agent-controller/issues)
 - [Domain glossary](docs/domain-glossary.md)
 - [Background](2026-07-30-pi与WSL结合优势.md)
 

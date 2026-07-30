@@ -163,6 +163,17 @@ Pi 在长期会话、会话内模型切换和 token 利用率方面很适合作�
 
 ## Further Notes
 
+### Delivery Issues
+
+1. [#2 Bootstrap Pi Package、Controller Core 与持久化 Run 生命周期](https://github.com/xuzhaorui/pi-agent-controller/issues/2)
+2. [#3 接入 GitHub Backlog 的确定性 Task 发现与领取](https://github.com/xuzhaorui/pi-agent-controller/issues/3)
+3. [#4 建立 Git Worktree Workspace 与结构化 Worker Execution](https://github.com/xuzhaorui/pi-agent-controller/issues/4)
+4. [#5 实现 Controller Verification 与独立 Reviewer 修复循环](https://github.com/xuzhaorui/pi-agent-controller/issues/5)
+5. [#6 完成 Merge、Issue 同步与自动领取下一 Task 的闭环](https://github.com/xuzhaorui/pi-agent-controller/issues/6)
+6. [#7 加入 Human Gate、危险操作保护与 Run Budget](https://github.com/xuzhaorui/pi-agent-controller/issues/7)
+7. [#8 强化 Crash Recovery、幂等性与 Repository Lease](https://github.com/xuzhaorui/pi-agent-controller/issues/8)
+8. [#9 交付 Git-installable MVP 文档、示例与端到端验收](https://github.com/xuzhaorui/pi-agent-controller/issues/9)
+
 - This product is intentionally a **Controller**, not an Agent Manager. Agent intelligence performs bounded work; deterministic reconciliation owns continuity.
 - The human remains responsible for Vision and high-impact Decisions. Agents own implementation and evidence gathering within Policy.
 - The key success metric is not lines of code generated. It is the percentage of eligible Tasks advanced from Ready to Done without an unnecessary human prompt, while preserving Verification quality and producing zero unauthorized guarded actions.
