@@ -36,6 +36,7 @@ type RecoveryState = {
   worker?: WorkerResult;
   evidence?: Evidence[];
   review?: ReviewResult;
+  reviewFindings?: string[];
 };
 
 export class ControllerCore {
@@ -59,6 +60,7 @@ export class ControllerCore {
   private recovery?: RecoveryState;
   private recoveredGate?: HumanGate;
   private recoveredFromJournal = false;
+  private retryFindings?: string[];
   private pendingGateTask?: Task;
   private pendingGateTaskNumber?: number;
   private pendingFinalize?: { taskNumber: number; task?: Task; workspace: Workspace; commit?: string; evidence: Evidence[] };
@@ -167,6 +169,9 @@ export class ControllerCore {
       core.recovery = undefined;
     } else if (review?.disposition === "approved") {
       core.recovery = { taskNumber, task: claimedTask, attempts: runEvents.slice(claimIndex + 1).filter((event) => event.type === "EXECUTION_STARTED").length, phase: "merge", claimRequired: Boolean(activeIntent), mergeApproved: gateKind === "merge" && Boolean(resolvedGate && resolvedGate.at >= (gateEvent?.at ?? 0) && (resolvedGate.data?.decision === "allow" || resolvedGate.reason === "allow")), worker, evidence, review, workspace: { taskNumber, path: String(workspaceEvent.data.path), branch: String(workspaceEvent.data.branch), baseBranch: String(workspaceEvent.data.baseBranch) } };
+    } else if (review?.disposition === "changes_requested") {
+      const attempts = runEvents.slice(claimIndex + 1).filter((event) => event.type === "EXECUTION_STARTED").length;
+      core.recovery = { taskNumber, task: claimedTask, attempts: Math.max(0, attempts - 1), phase: "worker", claimRequired: Boolean(activeIntent), reviewFindings: review.findings, workspace: { taskNumber, path: String(workspaceEvent.data.path), branch: String(workspaceEvent.data.branch), baseBranch: String(workspaceEvent.data.baseBranch) } };
     } else if (verification?.data?.passed === true) {
       core.recovery = { taskNumber, task: claimedTask, attempts: runEvents.slice(claimIndex + 1).filter((event) => event.type === "EXECUTION_STARTED").length, phase: "review", claimRequired: Boolean(activeIntent), worker, evidence, workspace: { taskNumber, path: String(workspaceEvent.data.path), branch: String(workspaceEvent.data.branch), baseBranch: String(workspaceEvent.data.baseBranch) } };
     } else if (worker?.outcome === "completed") {
@@ -436,8 +441,10 @@ export class ControllerCore {
         await this.append("EXECUTION_STARTED", task.number, "worker started", undefined, { attempt: this.currentTaskAttempts });
       }
       let worker: WorkerResult;
+      const workerReviewFindings = this.retryFindings ?? checkpointState?.reviewFindings;
+      this.retryFindings = undefined;
       try {
-        worker = restoredWorker ?? await this.executeAgent("worker", task, this.currentWorkspace, signal) as WorkerResult;
+        worker = restoredWorker ?? await this.executeAgent("worker", task, this.currentWorkspace, signal, undefined, workerReviewFindings) as WorkerResult;
       } catch (error) {
         if (signal.aborted) throw error;
         const reason = error instanceof Error ? error.message : String(error);
@@ -502,6 +509,7 @@ export class ControllerCore {
         await this.append("REVIEW_FINISHED", task.number, "review finished", evidence.map((item) => item.id), { disposition: review.disposition, result: review });
       }
       if (review.disposition === "changes_requested") {
+        this.retryFindings = review.findings;
         if (this.currentTaskAttempts < this.policy.maxAttemptsPerTask) continue;
         await this.blockTask(task, `review requested changes: ${review.findings.join(", ")}`);
         return;
@@ -551,7 +559,7 @@ export class ControllerCore {
     await this.adapters.workspaces.cleanup(workspace, this.policy, true);
   }
 
-  private async executeAgent(role: "worker" | "reviewer", task: Task, workspace: Workspace, signal: AbortSignal, evidence: Evidence[] = []): Promise<WorkerResult | ReviewResult> {
+  private async executeAgent(role: "worker" | "reviewer", task: Task, workspace: Workspace, signal: AbortSignal, evidence: Evidence[] = [], reviewFindings?: string[]): Promise<WorkerResult | ReviewResult> {
     const rolePolicy = this.policy.roles[role];
     const diff = role === "reviewer" ? await this.adapters.workspaces.diff(workspace) : undefined;
     const handoff: Handoff = {
@@ -567,6 +575,7 @@ export class ControllerCore {
       outputContract: role === "worker" ? "WorkerResult v1" : "ReviewResult v1",
       ...(evidence.length > 0 ? { evidence } : {}),
       ...(diff !== undefined ? { diff: limitContext(diff) } : {}),
+      ...(reviewFindings && reviewFindings.length > 0 ? { reviewFindings } : {}),
     };
     const result = await this.adapters.agents.execute(role, handoff, signal);
     if (role === "worker" && !isWorkerResult(result)) throw new Error("Agent returned an invalid WorkerResult");
@@ -621,7 +630,7 @@ export class ControllerCore {
       phase: this.runValue.phase,
       ...(reason ? { reason } : {}),
       ...(evidenceIds && evidenceIds.length > 0 ? { evidenceIds } : {}),
-      ...(data ? { data } : {}),
+      ...(data ? { data: sanitizeRecord(data) } : {}),
     };
     this.eventBuffer.push(event);
     await this.adapters.journal.append(event);
@@ -670,6 +679,23 @@ export class ControllerCore {
   private now(): number {
     return this.adapters.now?.() ?? Date.now();
   }
+}
+
+function sanitizeRecord(data: Record<string, unknown>): Record<string, unknown> {
+  return sanitizeValue(data) as Record<string, unknown>;
+}
+
+function sanitizeValue(value: unknown): unknown {
+  if (typeof value === "string") {
+    return value
+      .replace(/(api[_-]?key|token|password|secret|authorization)\s*([:=])\s*([^\s,;]+)/gi, "$1$2[REDACTED]")
+      .replace(/(bearer)\s+[a-z0-9._~+\/-]+=*/gi, "$1 [REDACTED]");
+  }
+  if (Array.isArray(value)) return value.map(sanitizeValue);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, sanitizeValue(item)]));
+  }
+  return value;
 }
 
 function limitContext(value: string): string {

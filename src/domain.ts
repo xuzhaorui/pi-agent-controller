@@ -129,6 +129,7 @@ export interface Handoff {
   outputContract: string;
   evidence?: Evidence[];
   diff?: string;
+  reviewFindings?: string[];
 }
 
 export interface Usage {

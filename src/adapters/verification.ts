@@ -18,6 +18,7 @@ export class LocalVerificationRunner implements VerificationRunner {
     for (const command of commands) {
       const started = Date.now();
       const result = await this.commands.run(command.command, command.args ?? [], { cwd: workspace.path, timeoutMs: command.timeoutMs ?? 10 * 60 * 1000, signal });
+      if (signal.aborted) throw new Error("Verification was cancelled");
       const fullOutput = redact(`${result.stdout}\n${result.stderr}`.trim(), this.secrets);
       const artifactDir = join(this.artifactRoot, `task-${workspace.taskNumber}`);
       await mkdir(artifactDir, { recursive: true });
