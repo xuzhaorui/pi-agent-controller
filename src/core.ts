@@ -25,7 +25,16 @@ const EMPTY_USAGE = { completedTasks: 0, attempts: 0, tokens: 0, cost: 0, starte
 
 type ControllerState = "new" | "active" | "paused" | "stopped";
 
-type RecoveryState = { taskNumber: number; workspace?: Workspace; task?: Task; attempts: number };
+type RecoveryState = {
+  taskNumber: number;
+  workspace?: Workspace;
+  task?: Task;
+  attempts: number;
+  phase: "worker" | "verification" | "review" | "merge";
+  worker?: WorkerResult;
+  evidence?: Evidence[];
+  review?: ReviewResult;
+};
 
 export class ControllerCore {
   private readonly adapters: ControllerAdapters;
@@ -50,6 +59,7 @@ export class ControllerCore {
   private pendingGateTask?: Task;
   private pendingGateTaskNumber?: number;
   private pendingFinalize?: { taskNumber: number; task?: Task; workspace: Workspace; commit?: string; evidence: Evidence[] };
+  private orphanCleanup?: Workspace;
 
   constructor(projectRoot: string, policy: ControllerPolicy, adapters: ControllerAdapters, runId?: string, recovery?: RecoveryState) {
     this.projectRoot = projectRoot;
@@ -89,7 +99,11 @@ export class ControllerCore {
       core.runValue.startedAt = started.at;
       core.runValue.usage.startedAt = started.at;
       core.restoreRunUsage(runEvents);
-      if (activeClaim && taskNumber !== undefined) core.recovery = { taskNumber, task: claimedTask, attempts: 0 };
+      if (activeClaim && taskNumber !== undefined) core.recovery = { taskNumber, task: claimedTask, attempts: 0, phase: "worker" };
+      if (!activeClaim && completedEvent?.taskNumber !== undefined) {
+        const completedWorkspace = lastEvent(runEvents, (event) => event.type === "WORKSPACE_CREATED" && event.taskNumber === completedEvent.taskNumber);
+        if (completedWorkspace?.data?.path && completedWorkspace.data.branch && completedWorkspace.data.baseBranch) core.orphanCleanup = { taskNumber: completedEvent.taskNumber, path: String(completedWorkspace.data.path), branch: String(completedWorkspace.data.branch), baseBranch: String(completedWorkspace.data.baseBranch) };
+      }
       const gateEvent = lastEvent(runEvents, (event) => event.type === "HUMAN_GATE_CREATED");
       const resolvedGate = lastEvent(runEvents, (event) => event.type === "HUMAN_GATE_RESOLVED");
       if (gateEvent && (!resolvedGate || resolvedGate.at < gateEvent.at)) {
@@ -106,6 +120,7 @@ export class ControllerCore {
     const core = new ControllerCore(projectRoot, policy, adapters, started.runId, {
       taskNumber,
       attempts: runEvents.slice(claimIndex + 1).filter((event) => event.type === "EXECUTION_STARTED").length,
+      phase: "worker",
       workspace: { taskNumber, path: String(workspaceEvent.data.path), branch: String(workspaceEvent.data.branch), baseBranch: String(workspaceEvent.data.baseBranch) },
     });
     core.eventBuffer.push(...runEvents);
@@ -124,17 +139,29 @@ export class ControllerCore {
     }
     const mergedEvent = lastEvent(runEvents, (event) => event.type === "TASK_MERGED" && event.taskNumber === taskNumber);
     const completedAfterMerge = completedEvent && mergedEvent && completedEvent.at >= mergedEvent.at;
+    const execution = lastEvent(runEvents, (event) => event.type === "EXECUTION_FINISHED" && event.taskNumber === taskNumber);
+    const worker = execution?.data?.result as WorkerResult | undefined;
     const verification = lastEvent(runEvents, (event) => event.type === "VERIFICATION_FINISHED" && event.taskNumber === taskNumber);
     const evidence = Array.isArray(verification?.data?.evidence) ? verification.data.evidence as Evidence[] : [];
+    if (evidence.length > 0) core.evidence.push(...evidence);
+    const reviewEvent = lastEvent(runEvents, (event) => event.type === "REVIEW_FINISHED" && event.taskNumber === taskNumber);
+    const review = reviewEvent?.data?.result as ReviewResult | undefined;
     const gateKind = gateEvent?.data?.kind;
     if (mergedEvent && !completedAfterMerge) {
       core.pendingFinalize = { taskNumber, task: claimedTask, workspace: { taskNumber, path: String(workspaceEvent.data.path), branch: String(workspaceEvent.data.branch), baseBranch: String(workspaceEvent.data.baseBranch) }, commit: typeof mergedEvent.data?.commit === "string" ? mergedEvent.data.commit : undefined, evidence };
       core.recovery = undefined;
     } else if (gateKind === "merge" && core.recoveredGate && claimedTask) {
-      const execution = lastEvent(runEvents, (event) => event.type === "EXECUTION_FINISHED" && event.taskNumber === taskNumber);
-      const worker = execution?.data?.result as WorkerResult | undefined;
       core.pendingMerge = { task: claimedTask, workspace: { taskNumber, path: String(workspaceEvent.data.path), branch: String(workspaceEvent.data.branch), baseBranch: String(workspaceEvent.data.baseBranch) }, commit: worker?.commit, evidence };
       core.recovery = undefined;
+    } else if (review?.disposition === "approved") {
+      core.recovery = { taskNumber, task: claimedTask, attempts: runEvents.slice(claimIndex + 1).filter((event) => event.type === "EXECUTION_STARTED").length, phase: "merge", worker, evidence, review, workspace: { taskNumber, path: String(workspaceEvent.data.path), branch: String(workspaceEvent.data.branch), baseBranch: String(workspaceEvent.data.baseBranch) } };
+    } else if (verification?.data?.passed === true) {
+      core.recovery = { taskNumber, task: claimedTask, attempts: runEvents.slice(claimIndex + 1).filter((event) => event.type === "EXECUTION_STARTED").length, phase: "review", worker, evidence, workspace: { taskNumber, path: String(workspaceEvent.data.path), branch: String(workspaceEvent.data.branch), baseBranch: String(workspaceEvent.data.baseBranch) } };
+    } else if (worker?.outcome === "completed") {
+      core.recovery = { taskNumber, task: claimedTask, attempts: runEvents.slice(claimIndex + 1).filter((event) => event.type === "EXECUTION_STARTED").length, phase: "verification", worker, workspace: { taskNumber, path: String(workspaceEvent.data.path), branch: String(workspaceEvent.data.branch), baseBranch: String(workspaceEvent.data.baseBranch) } };
+    } else {
+      const attempts = runEvents.slice(claimIndex + 1).filter((event) => event.type === "EXECUTION_STARTED").length;
+      core.recovery = { taskNumber, task: claimedTask, attempts: Math.max(0, attempts - 1), phase: "worker", workspace: { taskNumber, path: String(workspaceEvent.data.path), branch: String(workspaceEvent.data.branch), baseBranch: String(workspaceEvent.data.baseBranch) } };
     }
     return core;
   }
@@ -217,6 +244,12 @@ export class ControllerCore {
           this.currentTask = undefined;
           this.currentWorkspace = undefined;
           continue;
+        }
+
+        if (this.orphanCleanup) {
+          const orphan = this.orphanCleanup;
+          this.orphanCleanup = undefined;
+          await this.adapters.workspaces.cleanup(orphan, this.policy, true);
         }
 
         if (this.recovery) {
@@ -365,13 +398,21 @@ export class ControllerCore {
       await this.append("WORKSPACE_CREATED", task.number, "workspace created", undefined, { path: this.currentWorkspace.path, branch: this.currentWorkspace.branch, baseBranch: this.currentWorkspace.baseBranch });
     }
 
+    let checkpoint = recovery;
     for (this.currentTaskAttempts += 1; this.currentTaskAttempts <= this.policy.maxAttemptsPerTask; this.currentTaskAttempts += 1) {
-      this.runValue.usage.attempts += 1;
-      this.runValue.phase = "RUNNING";
-      await this.append("EXECUTION_STARTED", task.number, "worker started", undefined, { attempt: this.currentTaskAttempts });
+      const checkpointState = checkpoint;
+      const restoredWorker = checkpointState && checkpointState.phase !== "worker" && checkpointState.worker ? checkpointState.worker : undefined;
+      if (restoredWorker) {
+        this.currentTaskAttempts = checkpointState!.attempts;
+        checkpoint = undefined;
+      } else {
+        this.runValue.usage.attempts += 1;
+        this.runValue.phase = "RUNNING";
+        await this.append("EXECUTION_STARTED", task.number, "worker started", undefined, { attempt: this.currentTaskAttempts });
+      }
       let worker: WorkerResult;
       try {
-        worker = await this.executeAgent("worker", task, this.currentWorkspace, signal) as WorkerResult;
+        worker = restoredWorker ?? await this.executeAgent("worker", task, this.currentWorkspace, signal) as WorkerResult;
       } catch (error) {
         if (signal.aborted) throw error;
         const reason = error instanceof Error ? error.message : String(error);
@@ -380,8 +421,10 @@ export class ControllerCore {
         await this.blockTask(task, `worker execution failed: ${reason}`);
         return;
       }
-      this.addUsage(worker.usage);
-      await this.append("EXECUTION_FINISHED", task.number, "worker finished", undefined, { outcome: worker.outcome, attempt: this.currentTaskAttempts, result: worker });
+      if (!restoredWorker) {
+        this.addUsage(worker.usage);
+        await this.append("EXECUTION_FINISHED", task.number, "worker finished", undefined, { outcome: worker.outcome, attempt: this.currentTaskAttempts, result: worker });
+      }
 
       if (worker.outcome !== "completed" || worker.recommendedDisposition !== "verify") {
         if (worker.outcome === "blocked" || worker.outcome === "needs_human") {
@@ -397,9 +440,12 @@ export class ControllerCore {
       if (commit) worker.commit = commit;
       this.runValue.phase = "VERIFYING";
       this.currentTask = { ...task, state: "VERIFYING" };
-      const evidence = await this.adapters.verification.run(this.currentWorkspace, this.policy.verification, signal);
-      this.evidence.push(...evidence);
-      await this.append("VERIFICATION_FINISHED", task.number, "verification finished", evidence.map((item) => item.id), { passed: requiredEvidencePassed(evidence, this.policy.verification), evidence });
+      const restoredEvidence = checkpointState && (checkpointState.phase === "review" || checkpointState.phase === "merge") ? checkpointState.evidence : undefined;
+      const evidence = restoredEvidence ?? await this.adapters.verification.run(this.currentWorkspace, this.policy.verification, signal);
+      if (!restoredEvidence) {
+        this.evidence.push(...evidence);
+        await this.append("VERIFICATION_FINISHED", task.number, "verification finished", evidence.map((item) => item.id), { passed: requiredEvidencePassed(evidence, this.policy.verification), evidence });
+      }
       if (!requiredEvidencePassed(evidence, this.policy.verification)) {
         if (this.currentTaskAttempts < this.policy.maxAttemptsPerTask) continue;
         await this.blockTask(task, "required verification failed");
@@ -409,10 +455,15 @@ export class ControllerCore {
 
       this.runValue.phase = "REVIEWING";
       this.currentTask = { ...task, state: "REVIEWING" };
-      await this.adapters.tasks.markReview(task, this.runId, this.policy.reviewLabel, `${this.runId}:task:${task.number}:review`);
       let review: ReviewResult;
+      const restoredReview = checkpointState?.phase === "merge" ? checkpointState.review : undefined;
       try {
-        review = await this.executeAgent("reviewer", task, this.currentWorkspace, signal, evidence) as ReviewResult;
+        if (restoredReview) {
+          review = restoredReview;
+        } else {
+          await this.adapters.tasks.markReview(task, this.runId, this.policy.reviewLabel, `${this.runId}:task:${task.number}:review`);
+          review = await this.executeAgent("reviewer", task, this.currentWorkspace, signal, evidence) as ReviewResult;
+        }
       } catch (error) {
         if (signal.aborted) throw error;
         const reason = error instanceof Error ? error.message : String(error);
@@ -421,8 +472,10 @@ export class ControllerCore {
         await this.blockTask(task, `review execution failed: ${reason}`);
         return;
       }
-      this.addUsage(review.usage);
-      await this.append("REVIEW_FINISHED", task.number, "review finished", evidence.map((item) => item.id), { disposition: review.disposition, result: review });
+      if (!restoredReview) {
+        this.addUsage(review.usage);
+        await this.append("REVIEW_FINISHED", task.number, "review finished", evidence.map((item) => item.id), { disposition: review.disposition, result: review });
+      }
       if (review.disposition === "changes_requested") {
         if (this.currentTaskAttempts < this.policy.maxAttemptsPerTask) continue;
         await this.blockTask(task, `review requested changes: ${review.findings.join(", ")}`);
@@ -550,7 +603,7 @@ export class ControllerCore {
 
   private async pauseAtCheckpoint(task: Task, workspace: Workspace, attempts: number): Promise<boolean> {
     if (!this.pauseRequested) return false;
-    this.recovery = { taskNumber: task.number, task, workspace, attempts: Math.max(0, attempts - 1) };
+    this.recovery = { taskNumber: task.number, task, workspace, attempts: Math.max(0, attempts - 1), phase: "worker" };
     await this.stop("PAUSED_BY_USER", "pause requested at safe checkpoint", true);
     return true;
   }

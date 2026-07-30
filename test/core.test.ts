@@ -212,6 +212,29 @@ test("resumes a merge Human Gate without reclaiming or re-running the Task", asy
   assert.equal(setup.agents.workers, 1);
 });
 
+test("resumes from Verification Evidence without rerunning completed Worker work", async () => {
+  const setup = adapters([task(1, 1)]);
+  const worker: WorkerResult = {
+    schemaVersion: 1, outcome: "completed", changedFiles: ["src/change.ts"], commit: "worker-commit", testsClaimed: [], risks: [], blockers: [], recommendedDisposition: "verify",
+    usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: 0, turns: 1 }, artifacts: [],
+  };
+  const evidence: Evidence = { id: "verification-1", kind: "verification", name: "tests", success: true, output: "ok", metadata: {} };
+  setup.journal.events.push(
+    { schemaVersion: 1, id: "run-phase:1", at: 100, type: "RUN_STARTED", runId: "run-phase" },
+    { schemaVersion: 1, id: "run-phase:2", at: 101, type: "TASK_CLAIMED", runId: "run-phase", taskNumber: 1, data: { task: task(1, 1) } },
+    { schemaVersion: 1, id: "run-phase:3", at: 102, type: "WORKSPACE_CREATED", runId: "run-phase", taskNumber: 1, data: { path: "/tmp/task-1", branch: "agent/task-1", baseBranch: "main" } },
+    { schemaVersion: 1, id: "run-phase:4", at: 103, type: "EXECUTION_FINISHED", runId: "run-phase", taskNumber: 1, data: { result: worker } },
+    { schemaVersion: 1, id: "run-phase:5", at: 104, type: "VERIFICATION_FINISHED", runId: "run-phase", taskNumber: 1, evidenceIds: [evidence.id], data: { evidence: [evidence], passed: true } },
+  );
+  const core = await ControllerCore.recover("/repo", policy(), setup.adapters);
+  assert.ok(core);
+  const result = await core.run(new AbortController().signal);
+  assert.equal(result.run.stopReason, "BACKLOG_EMPTY");
+  assert.equal(setup.agents.workers, 0);
+  assert.equal(setup.agents.reviewers, 1);
+  assert.equal(setup.verification.calls, 0);
+});
+
 test("recovers an interrupted Run in the existing Workspace without claiming twice", async () => {
   const setup = adapters([task(1, 1)]);
   setup.journal.events.push(
