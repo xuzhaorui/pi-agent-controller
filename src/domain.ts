@@ -190,7 +190,9 @@ export type JournalEventType =
   | "RUN_STARTED"
   | "RUN_STOPPED"
   | "TASK_DISCOVERED"
+  | "TASK_CLAIMING"
   | "TASK_CLAIMED"
+  | "WORKSPACE_CREATING"
   | "WORKSPACE_CREATED"
   | "EXECUTION_STARTED"
   | "EXECUTION_FINISHED"
@@ -234,6 +236,7 @@ export interface WorkspaceManager {
   merge(workspace: Workspace, policy: ControllerPolicy): Promise<{ commit?: string }>;
   cleanup(workspace: Workspace, policy: ControllerPolicy, success: boolean): Promise<void>;
   validate?(workspace: Workspace): Promise<boolean>;
+  find?(task: Task, policy: ControllerPolicy): Promise<Workspace | undefined>;
 }
 
 export interface AgentRuntime {

@@ -31,6 +31,7 @@ type RecoveryState = {
   task?: Task;
   attempts: number;
   phase: "worker" | "verification" | "review" | "merge";
+  claimRequired?: boolean;
   worker?: WorkerResult;
   evidence?: Evidence[];
   review?: ReviewResult;
@@ -88,18 +89,21 @@ export class ControllerCore {
     const stopped = lastEvent(runEvents, (event) => event.type === "RUN_STOPPED");
     if (stopped && stopped.data?.paused !== true) return undefined;
     const claimEvent = lastEvent(runEvents, (event) => event.type === "TASK_CLAIMED");
+    const claimIntent = lastEvent(runEvents, (event) => event.type === "TASK_CLAIMING");
     const completedEvent = lastEvent(runEvents, (event) => event.type === "TASK_COMPLETED");
     const activeClaim = claimEvent && (!completedEvent || completedEvent.at < claimEvent.at) ? claimEvent : undefined;
-    const workspaceEvent = activeClaim ? lastEvent(runEvents, (event) => event.type === "WORKSPACE_CREATED" && event.taskNumber === activeClaim.taskNumber) : undefined;
-    const taskNumber = activeClaim?.taskNumber;
-    const claimedTask = activeClaim?.data?.task && typeof activeClaim.data.task === "object" ? activeClaim.data.task as Task : undefined;
+    const activeIntent = claimIntent && (!claimEvent || claimIntent.at > claimEvent.at) ? claimIntent : undefined;
+    const currentClaim = activeClaim ?? activeIntent;
+    const workspaceEvent = currentClaim ? lastEvent(runEvents, (event) => event.type === "WORKSPACE_CREATED" && event.taskNumber === currentClaim.taskNumber) : undefined;
+    const taskNumber = currentClaim?.taskNumber;
+    const claimedTask = currentClaim?.data?.task && typeof currentClaim.data.task === "object" ? currentClaim.data.task as Task : undefined;
     if (taskNumber === undefined || !workspaceEvent?.data?.path || !workspaceEvent.data.branch || !workspaceEvent.data.baseBranch) {
       const core = new ControllerCore(projectRoot, policy, adapters, started.runId);
       core.eventBuffer.push(...runEvents);
       core.runValue.startedAt = started.at;
       core.runValue.usage.startedAt = started.at;
       core.restoreRunUsage(runEvents);
-      if (activeClaim && taskNumber !== undefined) core.recovery = { taskNumber, task: claimedTask, attempts: 0, phase: "worker" };
+      if (currentClaim && taskNumber !== undefined) core.recovery = { taskNumber, task: claimedTask, attempts: 0, phase: "worker", claimRequired: Boolean(activeIntent) };
       if (!activeClaim && completedEvent?.taskNumber !== undefined) {
         const completedWorkspace = lastEvent(runEvents, (event) => event.type === "WORKSPACE_CREATED" && event.taskNumber === completedEvent.taskNumber);
         if (completedWorkspace?.data?.path && completedWorkspace.data.branch && completedWorkspace.data.baseBranch) core.orphanCleanup = { taskNumber: completedEvent.taskNumber, path: String(completedWorkspace.data.path), branch: String(completedWorkspace.data.branch), baseBranch: String(completedWorkspace.data.baseBranch) };
@@ -109,7 +113,7 @@ export class ControllerCore {
       if (gateEvent && (!resolvedGate || resolvedGate.at < gateEvent.at)) {
         const gateId = String(gateEvent.data?.gateId ?? `${started.runId}:recovered-gate`);
         const kind = gateEvent.data?.kind === "merge" ? "merge" : "task";
-        core.recoveredGate = { id: gateId, kind, reason: gateEvent.reason ?? "recovered Human Gate", options: Array.isArray(gateEvent.data?.options) ? gateEvent.data.options.map(String) : ["allow", "reject"], evidenceIds: gateEvent.evidenceIds ?? [], status: "pending" };
+        core.recoveredGate = { id: gateId, kind, reason: gateEvent.reason ?? "recovered Human Gate", options: Array.isArray(gateEvent.data?.options) ? gateEvent.data.options.map(String) : ["allow", "reject"], recommendation: typeof gateEvent.data?.recommendation === "string" ? gateEvent.data.recommendation : undefined, evidenceIds: gateEvent.evidenceIds ?? [], status: "pending" };
         const gateTask = gateEvent.data?.task && typeof gateEvent.data.task === "object" ? gateEvent.data.task as Task : claimedTask;
         if (gateTask) core.currentTask = gateTask;
         if (kind === "task" && gateEvent.taskNumber !== undefined) core.pendingGateTaskNumber = gateEvent.taskNumber;
@@ -121,6 +125,7 @@ export class ControllerCore {
       taskNumber,
       attempts: runEvents.slice(claimIndex + 1).filter((event) => event.type === "EXECUTION_STARTED").length,
       phase: "worker",
+      claimRequired: Boolean(activeIntent),
       workspace: { taskNumber, path: String(workspaceEvent.data.path), branch: String(workspaceEvent.data.branch), baseBranch: String(workspaceEvent.data.baseBranch) },
     });
     core.eventBuffer.push(...runEvents);
@@ -132,7 +137,7 @@ export class ControllerCore {
     if (gateEvent && (!resolvedGate || resolvedGate.at < gateEvent.at)) {
       const gateId = String(gateEvent.data?.gateId ?? `${started.runId}:recovered-gate`);
       const kind = gateEvent.data?.kind === "merge" ? "merge" : "task";
-      core.recoveredGate = { id: gateId, kind, reason: gateEvent.reason ?? "recovered Human Gate", options: Array.isArray(gateEvent.data?.options) ? gateEvent.data.options.map(String) : ["allow", "reject"], evidenceIds: gateEvent.evidenceIds ?? [], status: "pending" };
+      core.recoveredGate = { id: gateId, kind, reason: gateEvent.reason ?? "recovered Human Gate", options: Array.isArray(gateEvent.data?.options) ? gateEvent.data.options.map(String) : ["allow", "reject"], recommendation: typeof gateEvent.data?.recommendation === "string" ? gateEvent.data.recommendation : undefined, evidenceIds: gateEvent.evidenceIds ?? [], status: "pending" };
       const gateTask = gateEvent.data?.task && typeof gateEvent.data.task === "object" ? gateEvent.data.task as Task : claimedTask;
       if (gateTask) core.currentTask = gateTask;
       if (kind === "task" && gateEvent.taskNumber !== undefined) core.pendingGateTaskNumber = gateEvent.taskNumber;
@@ -154,14 +159,14 @@ export class ControllerCore {
       core.pendingMerge = { task: claimedTask, workspace: { taskNumber, path: String(workspaceEvent.data.path), branch: String(workspaceEvent.data.branch), baseBranch: String(workspaceEvent.data.baseBranch) }, commit: worker?.commit, evidence };
       core.recovery = undefined;
     } else if (review?.disposition === "approved") {
-      core.recovery = { taskNumber, task: claimedTask, attempts: runEvents.slice(claimIndex + 1).filter((event) => event.type === "EXECUTION_STARTED").length, phase: "merge", worker, evidence, review, workspace: { taskNumber, path: String(workspaceEvent.data.path), branch: String(workspaceEvent.data.branch), baseBranch: String(workspaceEvent.data.baseBranch) } };
+      core.recovery = { taskNumber, task: claimedTask, attempts: runEvents.slice(claimIndex + 1).filter((event) => event.type === "EXECUTION_STARTED").length, phase: "merge", claimRequired: Boolean(activeIntent), worker, evidence, review, workspace: { taskNumber, path: String(workspaceEvent.data.path), branch: String(workspaceEvent.data.branch), baseBranch: String(workspaceEvent.data.baseBranch) } };
     } else if (verification?.data?.passed === true) {
-      core.recovery = { taskNumber, task: claimedTask, attempts: runEvents.slice(claimIndex + 1).filter((event) => event.type === "EXECUTION_STARTED").length, phase: "review", worker, evidence, workspace: { taskNumber, path: String(workspaceEvent.data.path), branch: String(workspaceEvent.data.branch), baseBranch: String(workspaceEvent.data.baseBranch) } };
+      core.recovery = { taskNumber, task: claimedTask, attempts: runEvents.slice(claimIndex + 1).filter((event) => event.type === "EXECUTION_STARTED").length, phase: "review", claimRequired: Boolean(activeIntent), worker, evidence, workspace: { taskNumber, path: String(workspaceEvent.data.path), branch: String(workspaceEvent.data.branch), baseBranch: String(workspaceEvent.data.baseBranch) } };
     } else if (worker?.outcome === "completed") {
       core.recovery = { taskNumber, task: claimedTask, attempts: runEvents.slice(claimIndex + 1).filter((event) => event.type === "EXECUTION_STARTED").length, phase: "verification", worker, workspace: { taskNumber, path: String(workspaceEvent.data.path), branch: String(workspaceEvent.data.branch), baseBranch: String(workspaceEvent.data.baseBranch) } };
     } else {
       const attempts = runEvents.slice(claimIndex + 1).filter((event) => event.type === "EXECUTION_STARTED").length;
-      core.recovery = { taskNumber, task: claimedTask, attempts: Math.max(0, attempts - 1), phase: "worker", workspace: { taskNumber, path: String(workspaceEvent.data.path), branch: String(workspaceEvent.data.branch), baseBranch: String(workspaceEvent.data.baseBranch) } };
+      core.recovery = { taskNumber, task: claimedTask, attempts: Math.max(0, attempts - 1), phase: "worker", claimRequired: Boolean(activeIntent), workspace: { taskNumber, path: String(workspaceEvent.data.path), branch: String(workspaceEvent.data.branch), baseBranch: String(workspaceEvent.data.baseBranch) } };
     }
     return core;
   }
@@ -386,16 +391,21 @@ export class ControllerCore {
     this.currentTaskAttempts = recovery?.attempts ?? 0;
     this.runValue.currentTask = task.number;
     this.runValue.phase = recovery ? "RECOVERING" : "CLAIMING";
+    const marker = `${this.runId}:task:${task.number}:claim`;
+    if (!recovery || recovery.claimRequired) {
+      await this.append("TASK_CLAIMING", task.number, "claiming task", undefined, { marker, task });
+      await this.adapters.tasks.claim(task, this.runId, this.policy.inProgressLabel, marker);
+      await this.append("TASK_CLAIMED", task.number, "task claimed", undefined, { marker, task });
+    }
     if (recovery?.workspace) {
       this.currentWorkspace = recovery.workspace;
     } else {
-      if (!recovery) {
-        const marker = `${this.runId}:task:${task.number}:claim`;
-        await this.adapters.tasks.claim(task, this.runId, this.policy.inProgressLabel, marker);
-        await this.append("TASK_CLAIMED", task.number, "task claimed", undefined, { marker, task });
-      }
-      this.currentWorkspace = await this.adapters.workspaces.create(task, this.policy);
-      await this.append("WORKSPACE_CREATED", task.number, "workspace created", undefined, { path: this.currentWorkspace.path, branch: this.currentWorkspace.branch, baseBranch: this.currentWorkspace.baseBranch });
+      const existing = recovery && this.adapters.workspaces.find ? await this.adapters.workspaces.find(task, this.policy) : undefined;
+      this.currentWorkspace = existing ?? await (async () => {
+        await this.append("WORKSPACE_CREATING", task.number, "creating workspace", undefined, { task });
+        return this.adapters.workspaces.create(task, this.policy);
+      })();
+      if (!existing) await this.append("WORKSPACE_CREATED", task.number, "workspace created", undefined, { path: this.currentWorkspace.path, branch: this.currentWorkspace.branch, baseBranch: this.currentWorkspace.baseBranch });
     }
 
     let checkpoint = recovery;
@@ -563,7 +573,7 @@ export class ControllerCore {
     this.runValue.stopReason = "HUMAN_DECISION_REQUIRED";
     this.runValue.phase = "AWAITING_HUMAN";
     this.state = "stopped";
-    await this.append("HUMAN_GATE_CREATED", task.number, reason, gate.evidenceIds, { gateId: gate.id, options, kind, task });
+    await this.append("HUMAN_GATE_CREATED", task.number, reason, gate.evidenceIds, { gateId: gate.id, options, kind, recommendation, task });
   }
 
   private async blockTask(task: Task, reason: string): Promise<void> {

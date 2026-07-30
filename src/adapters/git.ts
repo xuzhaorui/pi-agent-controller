@@ -1,4 +1,4 @@
-import { mkdir } from "node:fs/promises";
+import { mkdir, stat } from "node:fs/promises";
 import { relative, resolve, sep } from "node:path";
 import type { ControllerPolicy, Task, Workspace, WorkspaceManager } from "../domain.js";
 import { type CommandRunner, LocalCommandRunner } from "./command.js";
@@ -10,7 +10,7 @@ export class GitWorkspaceManager implements WorkspaceManager {
     const status = await this.commands.run("git", ["status", "--porcelain"], { cwd: this.projectRoot, timeoutMs: 10_000 });
     if (status.code !== 0) throw new Error(`cannot inspect repository: ${status.stderr.trim()}`);
     if (status.stdout.trim()) throw new Error("repository has uncommitted changes; refusing to create a Workspace");
-    const branch = `${policy.branchPrefix}${task.number}`.replace(/[^a-zA-Z0-9._/-]+/g, "-").replace(/\/{2,}/g, "/");
+    const branch = branchName(task, policy);
     const root = resolve(this.projectRoot, policy.workspaceRoot);
     const path = resolve(root, `task-${task.number}`);
     if (!isWithin(root, path)) throw new Error("Workspace path escapes configured workspaceRoot");
@@ -20,13 +20,34 @@ export class GitWorkspaceManager implements WorkspaceManager {
     return { taskNumber: task.number, path, branch, baseBranch: policy.baseBranch };
   }
 
+  async find(task: Task, policy: ControllerPolicy): Promise<Workspace | undefined> {
+    const branch = branchName(task, policy);
+    const result = await this.commands.run("git", ["worktree", "list", "--porcelain"], { cwd: this.projectRoot, timeoutMs: 10_000 });
+    if (result.code !== 0) return undefined;
+    const lines = result.stdout.split(/\r?\n/);
+    for (let index = 0; index < lines.length; index += 1) {
+      if (lines[index] !== `branch refs/heads/${branch}`) continue;
+      const block = lines.slice(Math.max(0, index - 2), index + 4);
+      if (block.includes("prunable")) return undefined;
+      const worktreeLine = lines.slice(0, index).reverse().find((line) => line.startsWith("worktree "));
+      const path = worktreeLine?.slice("worktree ".length);
+      if (!path) return undefined;
+      try { await stat(path); } catch { return undefined; }
+      return { taskNumber: task.number, path, branch, baseBranch: policy.baseBranch };
+    }
+    return undefined;
+  }
+
   async validate(workspace: Workspace): Promise<boolean> {
     const result = await this.commands.run("git", ["worktree", "list", "--porcelain"], { cwd: this.projectRoot, timeoutMs: 10_000 });
     if (result.code !== 0) return false;
     const lines = result.stdout.split(/\r?\n/);
     for (let index = 0; index < lines.length; index += 1) {
       if (lines[index] !== `worktree ${workspace.path}`) continue;
+      const block = lines.slice(index, lines.findIndex((line, offset) => offset > index && line === "") >= 0 ? lines.findIndex((line, offset) => offset > index && line === "") : lines.length);
+      if (block.includes("prunable")) return false;
       const branch = lines[index + 2];
+      try { await stat(workspace.path); } catch { return false; }
       return branch === `branch refs/heads/${workspace.branch}`;
     }
     return false;
@@ -58,6 +79,10 @@ export class GitWorkspaceManager implements WorkspaceManager {
     await this.commands.run("git", ["worktree", "remove", workspace.path], { cwd: this.projectRoot, timeoutMs: 30_000 });
     if (success) await this.commands.run("git", ["branch", "-d", workspace.branch], { cwd: this.projectRoot, timeoutMs: 10_000 });
   }
+}
+
+function branchName(task: Task, policy: ControllerPolicy): string {
+  return `${policy.branchPrefix}${task.number}`.replace(/[^a-zA-Z0-9._/-]+/g, "-").replace(/\/{2,}/g, "/");
 }
 
 function isWithin(root: string, candidate: string): boolean {
