@@ -47,6 +47,9 @@ export class ControllerCore {
   private gateDecision?: string;
   private recovery?: RecoveryState;
   private recoveredGate?: HumanGate;
+  private pendingGateTask?: Task;
+  private pendingGateTaskNumber?: number;
+  private pendingFinalize?: { taskNumber: number; task?: Task; workspace: Workspace; commit?: string; evidence: Evidence[] };
 
   constructor(projectRoot: string, policy: ControllerPolicy, adapters: ControllerAdapters, runId?: string, recovery?: RecoveryState) {
     this.projectRoot = projectRoot;
@@ -73,18 +76,28 @@ export class ControllerCore {
     if (!started) return undefined;
     const runEvents = events.slice(startIndex).filter((event) => event.runId === started.runId);
     const stopped = lastEvent(runEvents, (event) => event.type === "RUN_STOPPED");
-    if (stopped) return undefined;
-    const workspaceEvent = lastEvent(runEvents, (event) => event.type === "WORKSPACE_CREATED");
-    const taskNumber = lastEvent(runEvents, (event) => event.type === "TASK_CLAIMED")?.taskNumber;
+    if (stopped && stopped.data?.paused !== true) return undefined;
+    const claimEvent = lastEvent(runEvents, (event) => event.type === "TASK_CLAIMED");
+    const completedEvent = lastEvent(runEvents, (event) => event.type === "TASK_COMPLETED");
+    const activeClaim = claimEvent && (!completedEvent || completedEvent.at < claimEvent.at) ? claimEvent : undefined;
+    const workspaceEvent = activeClaim ? lastEvent(runEvents, (event) => event.type === "WORKSPACE_CREATED" && event.taskNumber === activeClaim.taskNumber) : undefined;
+    const taskNumber = activeClaim?.taskNumber;
     if (taskNumber === undefined || !workspaceEvent?.data?.path || !workspaceEvent.data.branch || !workspaceEvent.data.baseBranch) {
       const core = new ControllerCore(projectRoot, policy, adapters, started.runId);
       core.eventBuffer.push(...runEvents);
       core.runValue.startedAt = started.at;
       core.runValue.usage.startedAt = started.at;
       core.restoreRunUsage(runEvents);
+      const gateEvent = lastEvent(runEvents, (event) => event.type === "HUMAN_GATE_CREATED");
+      const resolvedGate = lastEvent(runEvents, (event) => event.type === "HUMAN_GATE_RESOLVED");
+      if (gateEvent && (!resolvedGate || resolvedGate.at < gateEvent.at)) {
+        const gateId = String(gateEvent.data?.gateId ?? `${started.runId}:recovered-gate`);
+        core.recoveredGate = { id: gateId, reason: gateEvent.reason ?? "recovered Human Gate", options: Array.isArray(gateEvent.data?.options) ? gateEvent.data.options.map(String) : ["allow", "reject"], evidenceIds: gateEvent.evidenceIds ?? [], status: "pending" };
+        if (gateEvent.taskNumber !== undefined) core.pendingGateTaskNumber = gateEvent.taskNumber;
+      }
       return core;
     }
-    const claimIndex = runEvents.reduce((latest, event, index) => event.type === "TASK_CLAIMED" ? index : latest, -1);
+    const claimIndex = runEvents.reduce((latest, event, index) => event.type === "TASK_CLAIMED" && event.taskNumber === taskNumber ? index : latest, -1);
     const core = new ControllerCore(projectRoot, policy, adapters, started.runId, {
       taskNumber,
       attempts: runEvents.slice(claimIndex + 1).filter((event) => event.type === "EXECUTION_STARTED").length,
@@ -99,6 +112,16 @@ export class ControllerCore {
     if (gateEvent && (!resolvedGate || resolvedGate.at < gateEvent.at)) {
       const gateId = String(gateEvent.data?.gateId ?? `${started.runId}:recovered-gate`);
       core.recoveredGate = { id: gateId, reason: gateEvent.reason ?? "recovered Human Gate", options: Array.isArray(gateEvent.data?.options) ? gateEvent.data.options.map(String) : ["allow", "reject"], evidenceIds: gateEvent.evidenceIds ?? [], status: "pending" };
+      if (gateEvent.taskNumber !== undefined) core.pendingGateTaskNumber = gateEvent.taskNumber;
+    }
+    const mergedEvent = lastEvent(runEvents, (event) => event.type === "TASK_MERGED" && event.taskNumber === taskNumber);
+    const completedAfterMerge = completedEvent && mergedEvent && completedEvent.at >= mergedEvent.at;
+    if (mergedEvent && !completedAfterMerge) {
+      const verification = lastEvent(runEvents, (event) => event.type === "VERIFICATION_FINISHED" && event.taskNumber === taskNumber);
+      const evidence = Array.isArray(verification?.data?.evidence) ? verification.data.evidence as Evidence[] : [];
+      const claimedTask = activeClaim?.data?.task && typeof activeClaim.data.task === "object" ? activeClaim.data.task as Task : undefined;
+      core.pendingFinalize = { taskNumber, task: claimedTask, workspace: { taskNumber, path: String(workspaceEvent.data.path), branch: String(workspaceEvent.data.branch), baseBranch: String(workspaceEvent.data.baseBranch) }, commit: typeof mergedEvent.data?.commit === "string" ? mergedEvent.data.commit : undefined, evidence };
+      core.recovery = undefined;
     }
     return core;
   }
@@ -165,6 +188,24 @@ export class ControllerCore {
           break;
         }
 
+        if (this.gateDecision && (this.pendingGateTask || this.pendingGateTaskNumber !== undefined)) {
+          const tasks = this.pendingGateTask ? [this.pendingGateTask] : await this.adapters.tasks.listOpenTasks();
+          const task = this.pendingGateTask ?? tasks.find((item) => item.number === this.pendingGateTaskNumber);
+          if (!task) {
+            await this.stop("BLOCKED", "approved Human Gate Task is no longer available");
+            break;
+          }
+          this.pendingGateTask = undefined;
+          this.pendingGateTaskNumber = undefined;
+          this.gateDecision = undefined;
+          this.runValue.gate = undefined;
+          this.runValue.stopReason = undefined;
+          await this.executeTask(task, activeSignal);
+          this.currentTask = undefined;
+          this.currentWorkspace = undefined;
+          continue;
+        }
+
         if (this.recovery) {
           const recovered = this.recovery;
           this.recovery = undefined;
@@ -175,6 +216,22 @@ export class ControllerCore {
             break;
           }
           await this.executeTask(task, activeSignal, recovered);
+          this.currentTask = undefined;
+          this.currentWorkspace = undefined;
+          continue;
+        }
+
+        if (this.pendingFinalize) {
+          const pending = this.pendingFinalize;
+          const tasks = await this.adapters.tasks.listOpenTasks();
+          const task = pending.task ?? tasks.find((item) => item.number === pending.taskNumber);
+          if (!task) {
+            await this.stop("BLOCKED", `merged Task #${pending.taskNumber} is no longer available for completion`);
+            break;
+          }
+          this.pendingFinalize = undefined;
+          this.currentWorkspace = pending.workspace;
+          await this.finalizeMergedTask(task, pending.workspace, pending.commit, pending.evidence);
           this.currentTask = undefined;
           this.currentWorkspace = undefined;
           continue;
@@ -201,6 +258,7 @@ export class ControllerCore {
 
         const guardedPattern = isGuarded(next, this.policy);
         if (guardedPattern && !this.gateDecision) {
+          this.pendingGateTask = next;
           await this.createHumanGate(next, `Task content matches guarded pattern: ${guardedPattern}`, ["allow", "reject"], "reject");
           break;
         }
@@ -274,7 +332,7 @@ export class ControllerCore {
     } else {
       const marker = `${this.runId}:task:${task.number}:claim`;
       await this.adapters.tasks.claim(task, this.runId, this.policy.inProgressLabel, marker);
-      await this.append("TASK_CLAIMED", task.number, "task claimed", undefined, { marker });
+      await this.append("TASK_CLAIMED", task.number, "task claimed", undefined, { marker, task });
       this.currentWorkspace = await this.adapters.workspaces.create(task, this.policy);
       await this.append("WORKSPACE_CREATED", task.number, "workspace created", undefined, { path: this.currentWorkspace.path, branch: this.currentWorkspace.branch, baseBranch: this.currentWorkspace.baseBranch });
     }
@@ -348,9 +406,13 @@ export class ControllerCore {
       return;
     }
     await this.append("TASK_MERGED", task.number, "task merged", evidence.map((item) => item.id), { commit: merged.commit });
-    const comment = `Controller Run ${this.runId} completed this Task.\n\nCommit: ${merged.commit ?? commit ?? "unknown"}\nVerification: ${evidence.map((item) => `${item.name}=${item.success ? "passed" : "failed"}`).join(", ") || "none"}`;
+    await this.finalizeMergedTask(task, workspace, merged.commit ?? commit, evidence);
+  }
+
+  private async finalizeMergedTask(task: Task, workspace: Workspace, commit: string | undefined, evidence: Evidence[]): Promise<void> {
+    const comment = `Controller Run ${this.runId} completed this Task.\n\nCommit: ${commit ?? "unknown"}\nVerification: ${evidence.map((item) => `${item.name}=${item.success ? "passed" : "failed"}`).join(", ") || "none"}`;
     await this.adapters.tasks.complete(task, this.runId, this.policy.doneLabel, comment, `${this.runId}:task:${task.number}:done`);
-    await this.append("TASK_COMPLETED", task.number, "task completed", evidence.map((item) => item.id), { commit: merged.commit ?? commit });
+    await this.append("TASK_COMPLETED", task.number, "task completed", evidence.map((item) => item.id), { commit });
     this.runValue.usage.completedTasks += 1;
     await this.adapters.workspaces.cleanup(workspace, this.policy, true);
   }
@@ -410,7 +472,7 @@ export class ControllerCore {
     this.runValue.stopReason = reason;
     this.runValue.updatedAt = this.now();
     this.runValue.phase = paused ? "PAUSED" : "STOPPED";
-    await this.append("RUN_STOPPED", this.currentTask?.number, detail, undefined, { stopReason: reason });
+    await this.append("RUN_STOPPED", this.currentTask?.number, detail, undefined, { stopReason: reason, paused });
   }
 
   private async append(type: JournalEvent["type"], taskNumber?: number, reason?: string, evidenceIds?: string[], data?: Record<string, unknown>): Promise<void> {
@@ -492,6 +554,10 @@ function requiredEvidencePassed(evidence: Evidence[], commands: VerificationComm
   return commands.every((command) => command.required === false || evidence.find((item) => item.name === command.name)?.success === true);
 }
 
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
 function isUsage(value: unknown): value is WorkerResult["usage"] {
   if (!value || typeof value !== "object") return false;
   const usage = value as Record<string, unknown>;
@@ -499,15 +565,15 @@ function isUsage(value: unknown): value is WorkerResult["usage"] {
 }
 
 function isWorkerResult(result: WorkerResult | ReviewResult): result is WorkerResult {
-  return "outcome" in result && ["completed", "failed", "blocked", "needs_human"].includes(result.outcome)
+  return result.schemaVersion === 1 && "outcome" in result && ["completed", "failed", "blocked", "needs_human"].includes(result.outcome)
     && ["verify", "retry", "blocked", "human"].includes(result.recommendedDisposition)
-    && Array.isArray(result.changedFiles) && Array.isArray(result.testsClaimed) && Array.isArray(result.risks)
-    && Array.isArray(result.blockers) && Array.isArray(result.artifacts) && isUsage(result.usage);
+    && isStringArray(result.changedFiles) && isStringArray(result.testsClaimed) && isStringArray(result.risks)
+    && isStringArray(result.blockers) && isStringArray(result.artifacts) && (result.commit === undefined || typeof result.commit === "string") && isUsage(result.usage);
 }
 
 function isReviewResult(result: WorkerResult | ReviewResult): result is ReviewResult {
-  return "disposition" in result && ["approved", "changes_requested", "blocked", "needs_human"].includes(result.disposition)
-    && Array.isArray(result.findings) && Array.isArray(result.risks) && Array.isArray(result.artifacts) && isUsage(result.usage);
+  return result.schemaVersion === 1 && "disposition" in result && ["approved", "changes_requested", "blocked", "needs_human"].includes(result.disposition)
+    && isStringArray(result.findings) && isStringArray(result.risks) && isStringArray(result.artifacts) && isUsage(result.usage);
 }
 
 export type { AgentRuntime };

@@ -234,14 +234,32 @@ test("requires a human decision before a guarded task can proceed", async () => 
   const setup = adapters([task(1, 1)]);
   const guarded = task(1, 1);
   guarded.title = "Change database migration";
-  const core = new ControllerCore("/repo", policy(), { ...setup.adapters, tasks: new FakeTasks([guarded]) });
+  const tracker = new FakeTasks([guarded]);
+  const core = new ControllerCore("/repo", policy(), { ...setup.adapters, tasks: tracker });
 
   const waiting = await core.run(new AbortController().signal);
   assert.equal(waiting.run.stopReason, "HUMAN_DECISION_REQUIRED");
   assert.equal(waiting.run.state, "PAUSED");
   assert.ok(waiting.run.gate);
 
+  tracker.tasks.push(task(2, 0));
   await core.approve(waiting.run.gate!.id, "allow");
   const completed = await core.run(new AbortController().signal);
   assert.equal(completed.run.stopReason, "BACKLOG_EMPTY");
+  assert.deepEqual(tracker.claimed, [1, 2]);
+});
+
+test("recovers a paused Run from the journal", async () => {
+  const setup = adapters([task(1, 1)]);
+  setup.journal.events.push(
+    { schemaVersion: 1, id: "run-2:1", at: 100, type: "RUN_STARTED", runId: "run-2" },
+    { schemaVersion: 1, id: "run-2:2", at: 101, type: "TASK_CLAIMED", runId: "run-2", taskNumber: 1, data: { task: task(1, 1) } },
+    { schemaVersion: 1, id: "run-2:3", at: 102, type: "WORKSPACE_CREATED", runId: "run-2", taskNumber: 1, data: { path: "/tmp/task-1", branch: "agent/task-1", baseBranch: "main" } },
+    { schemaVersion: 1, id: "run-2:4", at: 103, type: "RUN_STOPPED", runId: "run-2", taskNumber: 1, reason: "pause requested", data: { stopReason: "PAUSED_BY_USER", paused: true } },
+  );
+  const core = await ControllerCore.recover("/repo", policy(), setup.adapters);
+  assert.ok(core);
+  const result = await core.run(new AbortController().signal);
+  assert.equal(result.run.stopReason, "BACKLOG_EMPTY");
+  assert.deepEqual(setup.tracker.claimed, []);
 });

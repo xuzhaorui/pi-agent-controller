@@ -84,14 +84,22 @@ function parseResult(text: string): WorkerResult | ReviewResult {
   if (start < 0 || end <= start) throw new Error("Agent did not return a JSON Result");
   let value: any;
   try { value = JSON.parse(text.slice(start, end + 1)); } catch { throw new Error("Agent returned malformed Result JSON"); }
-  if (value?.schemaVersion !== 1 || !value?.usage || !Array.isArray(value.artifacts)) throw new Error("Agent Result failed schema validation");
-  if ("outcome" in value && ["completed", "failed", "blocked", "needs_human"].includes(value.outcome) && Array.isArray(value.changedFiles) && Array.isArray(value.testsClaimed) && Array.isArray(value.risks) && Array.isArray(value.blockers) && ["verify", "retry", "blocked", "human"].includes(value.recommendedDisposition)) {
+  if (value?.schemaVersion !== 1 || !isUsage(value.usage) || !isStringArray(value.artifacts)) throw new Error("Agent Result failed schema validation");
+  if ("outcome" in value && ["completed", "failed", "blocked", "needs_human"].includes(value.outcome) && isStringArray(value.changedFiles) && isStringArray(value.testsClaimed) && isStringArray(value.risks) && isStringArray(value.blockers) && ["verify", "retry", "blocked", "human"].includes(value.recommendedDisposition) && (value.commit === undefined || typeof value.commit === "string")) {
     return value as WorkerResult;
   }
-  if ("disposition" in value && ["approved", "changes_requested", "blocked", "needs_human"].includes(value.disposition) && Array.isArray(value.findings) && Array.isArray(value.risks)) {
+  if ("disposition" in value && ["approved", "changes_requested", "blocked", "needs_human"].includes(value.disposition) && isStringArray(value.findings) && isStringArray(value.risks)) {
     return value as ReviewResult;
   }
   throw new Error("Agent Result failed role schema validation");
+}
+
+function isStringArray(value: unknown): value is string[] { return Array.isArray(value) && value.every((item) => typeof item === "string"); }
+
+function isUsage(value: unknown): value is Usage {
+  if (!value || typeof value !== "object") return false;
+  const usage = value as Record<string, unknown>;
+  return ["input", "output", "cacheRead", "cacheWrite", "totalTokens", "cost", "turns"].every((key) => typeof usage[key] === "number" && Number.isFinite(usage[key]));
 }
 
 function emptyUsage(): Usage { return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: 0, turns: 0 }; }

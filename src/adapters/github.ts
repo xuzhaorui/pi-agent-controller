@@ -18,11 +18,16 @@ export class GitHubIssueTracker implements TaskTracker {
   ) {}
 
   async listOpenTasks(): Promise<Task[]> {
-    const result = await this.commands.run("gh", ["issue", "list", "--repo", this.repo, "--state", "open", "--limit", "100", "--json", "number,title,body,url,labels"], { timeoutMs: 30_000 });
+    const result = await this.commands.run("gh", ["api", "--paginate", `repos/${this.repo}/issues?state=open&per_page=100`, "--jq", ".[] | @json"], { timeoutMs: 30_000 });
     if (result.code !== 0) throw new Error(`GitHub issue discovery failed: ${result.stderr.trim() || result.stdout.trim()}`);
-    let issues: GitHubIssueJson[];
-    try { issues = JSON.parse(result.stdout) as GitHubIssueJson[]; }
-    catch { throw new Error("GitHub issue discovery returned malformed JSON"); }
+    const issues: GitHubIssueJson[] = [];
+    try {
+      for (const line of result.stdout.split(/\r?\n/).filter(Boolean)) {
+        const encoded = JSON.parse(line) as string;
+        const issue = JSON.parse(encoded) as GitHubIssueJson & { pull_request?: unknown; html_url?: string };
+        if (!issue.pull_request) issues.push({ ...issue, url: issue.url ?? issue.html_url ?? "" });
+      }
+    } catch { throw new Error("GitHub issue discovery returned malformed JSON"); }
     return issues.map((issue) => {
       const labels = issue.labels.map((label) => label.name);
       const task = taskFromIssue({ number: issue.number, title: issue.title, body: issue.body ?? "", url: issue.url, labels }, this.policy);
