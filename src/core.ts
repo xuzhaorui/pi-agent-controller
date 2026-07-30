@@ -117,6 +117,9 @@ export class ControllerCore {
         const gateTask = gateEvent.data?.task && typeof gateEvent.data.task === "object" ? gateEvent.data.task as Task : claimedTask;
         if (gateTask) core.currentTask = gateTask;
         if (kind === "task" && gateEvent.taskNumber !== undefined) core.pendingGateTaskNumber = gateEvent.taskNumber;
+      } else if (gateEvent && resolvedGate && resolvedGate.at >= gateEvent.at && gateEvent.data?.kind === "task" && (resolvedGate.data?.decision === "allow" || resolvedGate.reason === "allow")) {
+        core.gateDecision = "allow";
+        if (gateEvent.taskNumber !== undefined) core.pendingGateTaskNumber = gateEvent.taskNumber;
       }
       return core;
     }
@@ -362,7 +365,7 @@ export class ControllerCore {
     this.gateDecision = decision;
     if (decision === "allow") this.pauseRequested = false;
     this.runValue.gate = { ...this.runValue.gate, status: decision === "allow" ? "approved" : "rejected", decision };
-    await this.append("HUMAN_GATE_RESOLVED", this.currentTask?.number, decision, [this.runValue.gate.id]);
+    await this.append("HUMAN_GATE_RESOLVED", this.currentTask?.number, decision, [this.runValue.gate.id], { decision });
     if (decision !== "allow") {
       await this.stop("BLOCKED", `human rejected gate: ${decision}`);
       await this.releaseLease();
@@ -461,7 +464,7 @@ export class ControllerCore {
         await this.blockTask(task, "required verification failed");
         return;
       }
-      if (await this.pauseAtCheckpoint(task, this.currentWorkspace, this.currentTaskAttempts)) return;
+      if (await this.pauseAtCheckpoint(task, this.currentWorkspace, this.currentTaskAttempts, worker, evidence, commit)) return;
 
       this.runValue.phase = "REVIEWING";
       this.currentTask = { ...task, state: "REVIEWING" };
@@ -611,9 +614,9 @@ export class ControllerCore {
     await this.adapters.journal.append(event);
   }
 
-  private async pauseAtCheckpoint(task: Task, workspace: Workspace, attempts: number): Promise<boolean> {
+  private async pauseAtCheckpoint(task: Task, workspace: Workspace, attempts: number, worker: WorkerResult, evidence: Evidence[], _commit: string | undefined): Promise<boolean> {
     if (!this.pauseRequested) return false;
-    this.recovery = { taskNumber: task.number, task, workspace, attempts: Math.max(0, attempts - 1), phase: "worker" };
+    this.recovery = { taskNumber: task.number, task, workspace, attempts, phase: "review", worker, evidence };
     await this.stop("PAUSED_BY_USER", "pause requested at safe checkpoint", true);
     return true;
   }
