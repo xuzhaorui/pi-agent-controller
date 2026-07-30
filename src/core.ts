@@ -25,7 +25,7 @@ const EMPTY_USAGE = { completedTasks: 0, attempts: 0, tokens: 0, cost: 0, starte
 
 type ControllerState = "new" | "active" | "paused" | "stopped";
 
-type RecoveryState = { taskNumber: number; workspace: Workspace; attempts: number };
+type RecoveryState = { taskNumber: number; workspace?: Workspace; task?: Task; attempts: number };
 
 export class ControllerCore {
   private readonly adapters: ControllerAdapters;
@@ -82,18 +82,22 @@ export class ControllerCore {
     const activeClaim = claimEvent && (!completedEvent || completedEvent.at < claimEvent.at) ? claimEvent : undefined;
     const workspaceEvent = activeClaim ? lastEvent(runEvents, (event) => event.type === "WORKSPACE_CREATED" && event.taskNumber === activeClaim.taskNumber) : undefined;
     const taskNumber = activeClaim?.taskNumber;
+    const claimedTask = activeClaim?.data?.task && typeof activeClaim.data.task === "object" ? activeClaim.data.task as Task : undefined;
     if (taskNumber === undefined || !workspaceEvent?.data?.path || !workspaceEvent.data.branch || !workspaceEvent.data.baseBranch) {
       const core = new ControllerCore(projectRoot, policy, adapters, started.runId);
       core.eventBuffer.push(...runEvents);
       core.runValue.startedAt = started.at;
       core.runValue.usage.startedAt = started.at;
       core.restoreRunUsage(runEvents);
+      if (activeClaim && taskNumber !== undefined) core.recovery = { taskNumber, task: claimedTask, attempts: 0 };
       const gateEvent = lastEvent(runEvents, (event) => event.type === "HUMAN_GATE_CREATED");
       const resolvedGate = lastEvent(runEvents, (event) => event.type === "HUMAN_GATE_RESOLVED");
       if (gateEvent && (!resolvedGate || resolvedGate.at < gateEvent.at)) {
         const gateId = String(gateEvent.data?.gateId ?? `${started.runId}:recovered-gate`);
         const kind = gateEvent.data?.kind === "merge" ? "merge" : "task";
         core.recoveredGate = { id: gateId, kind, reason: gateEvent.reason ?? "recovered Human Gate", options: Array.isArray(gateEvent.data?.options) ? gateEvent.data.options.map(String) : ["allow", "reject"], evidenceIds: gateEvent.evidenceIds ?? [], status: "pending" };
+        const gateTask = gateEvent.data?.task && typeof gateEvent.data.task === "object" ? gateEvent.data.task as Task : claimedTask;
+        if (gateTask) core.currentTask = gateTask;
         if (kind === "task" && gateEvent.taskNumber !== undefined) core.pendingGateTaskNumber = gateEvent.taskNumber;
       }
       return core;
@@ -114,11 +118,12 @@ export class ControllerCore {
       const gateId = String(gateEvent.data?.gateId ?? `${started.runId}:recovered-gate`);
       const kind = gateEvent.data?.kind === "merge" ? "merge" : "task";
       core.recoveredGate = { id: gateId, kind, reason: gateEvent.reason ?? "recovered Human Gate", options: Array.isArray(gateEvent.data?.options) ? gateEvent.data.options.map(String) : ["allow", "reject"], evidenceIds: gateEvent.evidenceIds ?? [], status: "pending" };
+      const gateTask = gateEvent.data?.task && typeof gateEvent.data.task === "object" ? gateEvent.data.task as Task : claimedTask;
+      if (gateTask) core.currentTask = gateTask;
       if (kind === "task" && gateEvent.taskNumber !== undefined) core.pendingGateTaskNumber = gateEvent.taskNumber;
     }
     const mergedEvent = lastEvent(runEvents, (event) => event.type === "TASK_MERGED" && event.taskNumber === taskNumber);
     const completedAfterMerge = completedEvent && mergedEvent && completedEvent.at >= mergedEvent.at;
-    const claimedTask = activeClaim?.data?.task && typeof activeClaim.data.task === "object" ? activeClaim.data.task as Task : undefined;
     const verification = lastEvent(runEvents, (event) => event.type === "VERIFICATION_FINISHED" && event.taskNumber === taskNumber);
     const evidence = Array.isArray(verification?.data?.evidence) ? verification.data.evidence as Evidence[] : [];
     const gateKind = gateEvent?.data?.kind;
@@ -218,12 +223,12 @@ export class ControllerCore {
           const recovered = this.recovery;
           this.recovery = undefined;
           const tasks = await this.adapters.tasks.listOpenTasks();
-          const task = tasks.find((item) => item.number === recovered.taskNumber);
+          const task = recovered.task ?? tasks.find((item) => item.number === recovered.taskNumber);
           if (!task) {
             await this.stop("BLOCKED", `recovery Task #${recovered.taskNumber} is no longer available`);
             break;
           }
-          if (!await this.workspaceIsAvailable(recovered.workspace)) {
+          if (recovered.workspace && !await this.workspaceIsAvailable(recovered.workspace)) {
             await this.stop("BLOCKED", `recovery Workspace for Task #${recovered.taskNumber} is stale or missing`);
             break;
           }
@@ -253,7 +258,7 @@ export class ControllerCore {
           continue;
         }
 
-        if (this.pendingMerge && this.gateDecision) {
+        if (this.pendingMerge && (this.gateDecision || this.runValue.stopReason === "PAUSED_BY_USER")) {
           const pending = this.pendingMerge;
           this.pendingMerge = undefined;
           this.gateDecision = undefined;
@@ -317,6 +322,7 @@ export class ControllerCore {
     if (this.runValue.gate?.id !== gateId || this.runValue.gate.status !== "pending") return false;
     if (!this.runValue.gate.options.includes(decision)) return false;
     this.gateDecision = decision;
+    if (decision === "allow") this.pauseRequested = false;
     this.runValue.gate = { ...this.runValue.gate, status: decision === "allow" ? "approved" : "rejected", decision };
     await this.append("HUMAN_GATE_RESOLVED", this.currentTask?.number, decision, [this.runValue.gate.id]);
     if (decision !== "allow") {
@@ -347,12 +353,14 @@ export class ControllerCore {
     this.currentTaskAttempts = recovery?.attempts ?? 0;
     this.runValue.currentTask = task.number;
     this.runValue.phase = recovery ? "RECOVERING" : "CLAIMING";
-    if (recovery) {
+    if (recovery?.workspace) {
       this.currentWorkspace = recovery.workspace;
     } else {
-      const marker = `${this.runId}:task:${task.number}:claim`;
-      await this.adapters.tasks.claim(task, this.runId, this.policy.inProgressLabel, marker);
-      await this.append("TASK_CLAIMED", task.number, "task claimed", undefined, { marker, task });
+      if (!recovery) {
+        const marker = `${this.runId}:task:${task.number}:claim`;
+        await this.adapters.tasks.claim(task, this.runId, this.policy.inProgressLabel, marker);
+        await this.append("TASK_CLAIMED", task.number, "task claimed", undefined, { marker, task });
+      }
       this.currentWorkspace = await this.adapters.workspaces.create(task, this.policy);
       await this.append("WORKSPACE_CREATED", task.number, "workspace created", undefined, { path: this.currentWorkspace.path, branch: this.currentWorkspace.branch, baseBranch: this.currentWorkspace.baseBranch });
     }
@@ -361,7 +369,17 @@ export class ControllerCore {
       this.runValue.usage.attempts += 1;
       this.runValue.phase = "RUNNING";
       await this.append("EXECUTION_STARTED", task.number, "worker started", undefined, { attempt: this.currentTaskAttempts });
-      const worker = await this.executeAgent("worker", task, this.currentWorkspace, signal) as WorkerResult;
+      let worker: WorkerResult;
+      try {
+        worker = await this.executeAgent("worker", task, this.currentWorkspace, signal) as WorkerResult;
+      } catch (error) {
+        if (signal.aborted) throw error;
+        const reason = error instanceof Error ? error.message : String(error);
+        await this.append("TASK_FAILED", task.number, reason, undefined, { phase: "worker", attempt: this.currentTaskAttempts });
+        if (this.currentTaskAttempts < this.policy.maxAttemptsPerTask) continue;
+        await this.blockTask(task, `worker execution failed: ${reason}`);
+        return;
+      }
       this.addUsage(worker.usage);
       await this.append("EXECUTION_FINISHED", task.number, "worker finished", undefined, { outcome: worker.outcome, attempt: this.currentTaskAttempts, result: worker });
 
@@ -387,11 +405,22 @@ export class ControllerCore {
         await this.blockTask(task, "required verification failed");
         return;
       }
+      if (await this.pauseAtCheckpoint(task, this.currentWorkspace, this.currentTaskAttempts)) return;
 
       this.runValue.phase = "REVIEWING";
       this.currentTask = { ...task, state: "REVIEWING" };
       await this.adapters.tasks.markReview(task, this.runId, this.policy.reviewLabel, `${this.runId}:task:${task.number}:review`);
-      const review = await this.executeAgent("reviewer", task, this.currentWorkspace, signal, evidence) as ReviewResult;
+      let review: ReviewResult;
+      try {
+        review = await this.executeAgent("reviewer", task, this.currentWorkspace, signal, evidence) as ReviewResult;
+      } catch (error) {
+        if (signal.aborted) throw error;
+        const reason = error instanceof Error ? error.message : String(error);
+        await this.append("TASK_FAILED", task.number, reason, evidence.map((item) => item.id), { phase: "review", attempt: this.currentTaskAttempts });
+        if (this.currentTaskAttempts < this.policy.maxAttemptsPerTask) continue;
+        await this.blockTask(task, `review execution failed: ${reason}`);
+        return;
+      }
       this.addUsage(review.usage);
       await this.append("REVIEW_FINISHED", task.number, "review finished", evidence.map((item) => item.id), { disposition: review.disposition, result: review });
       if (review.disposition === "changes_requested") {
@@ -404,9 +433,15 @@ export class ControllerCore {
         return;
       }
 
+      const pendingMerge = { task, workspace: this.currentWorkspace, commit, evidence };
       if (!this.policy.autoMerge || this.policy.requireHumanForMerge || this.policy.protectedBranches.includes(this.policy.baseBranch)) {
-        this.pendingMerge = { task, workspace: this.currentWorkspace, commit, evidence };
+        this.pendingMerge = pendingMerge;
         await this.createHumanGate(task, "merge requires human approval", ["allow", "reject"], "allow", "merge");
+        return;
+      }
+      if (this.pauseRequested) {
+        this.pendingMerge = pendingMerge;
+        await this.stop("PAUSED_BY_USER", "pause requested before merge", true);
         return;
       }
 
@@ -475,7 +510,7 @@ export class ControllerCore {
     this.runValue.stopReason = "HUMAN_DECISION_REQUIRED";
     this.runValue.phase = "AWAITING_HUMAN";
     this.state = "stopped";
-    await this.append("HUMAN_GATE_CREATED", task.number, reason, gate.evidenceIds, { gateId: gate.id, options, kind });
+    await this.append("HUMAN_GATE_CREATED", task.number, reason, gate.evidenceIds, { gateId: gate.id, options, kind, task });
   }
 
   private async blockTask(task: Task, reason: string): Promise<void> {
@@ -511,6 +546,13 @@ export class ControllerCore {
     };
     this.eventBuffer.push(event);
     await this.adapters.journal.append(event);
+  }
+
+  private async pauseAtCheckpoint(task: Task, workspace: Workspace, attempts: number): Promise<boolean> {
+    if (!this.pauseRequested) return false;
+    this.recovery = { taskNumber: task.number, task, workspace, attempts: Math.max(0, attempts - 1) };
+    await this.stop("PAUSED_BY_USER", "pause requested at safe checkpoint", true);
+    return true;
   }
 
   private async workspaceIsAvailable(workspace: Workspace): Promise<boolean> {
