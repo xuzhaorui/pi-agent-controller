@@ -429,6 +429,8 @@ export class ControllerCore {
     }
 
     let checkpoint = recovery;
+    let reviewFindings = this.retryFindings ?? recovery?.reviewFindings;
+    this.retryFindings = undefined;
     for (this.currentTaskAttempts += 1; this.currentTaskAttempts <= this.policy.maxAttemptsPerTask; this.currentTaskAttempts += 1) {
       const checkpointState = checkpoint;
       const restoredWorker = checkpointState && checkpointState.phase !== "worker" && checkpointState.worker ? checkpointState.worker : undefined;
@@ -441,15 +443,17 @@ export class ControllerCore {
         await this.append("EXECUTION_STARTED", task.number, "worker started", undefined, { attempt: this.currentTaskAttempts });
       }
       let worker: WorkerResult;
-      const workerReviewFindings = this.retryFindings ?? checkpointState?.reviewFindings;
-      this.retryFindings = undefined;
+      const workerReviewFindings = reviewFindings ?? checkpointState?.reviewFindings;
       try {
         worker = restoredWorker ?? await this.executeAgent("worker", task, this.currentWorkspace, signal, undefined, workerReviewFindings) as WorkerResult;
       } catch (error) {
         if (signal.aborted) throw error;
         const reason = error instanceof Error ? error.message : String(error);
         await this.append("TASK_FAILED", task.number, reason, undefined, { phase: "worker", attempt: this.currentTaskAttempts });
-        if (this.currentTaskAttempts < this.policy.maxAttemptsPerTask) continue;
+        if (this.currentTaskAttempts < this.policy.maxAttemptsPerTask) {
+          if (await this.pauseBeforeRetry(task, this.currentWorkspace, reviewFindings)) return;
+          continue;
+        }
         await this.blockTask(task, `worker execution failed: ${reason}`);
         return;
       }
@@ -463,7 +467,10 @@ export class ControllerCore {
           await this.blockTask(task, `worker blocked task: ${worker.blockers.join(", ") || worker.outcome}`);
           return;
         }
-        if (this.currentTaskAttempts < this.policy.maxAttemptsPerTask) continue;
+        if (this.currentTaskAttempts < this.policy.maxAttemptsPerTask) {
+          if (await this.pauseBeforeRetry(task, this.currentWorkspace, reviewFindings)) return;
+          continue;
+        }
         await this.blockTask(task, "worker failed within attempt budget");
         return;
       }
@@ -474,7 +481,10 @@ export class ControllerCore {
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error);
         await this.append("TASK_FAILED", task.number, reason, undefined, { phase: "workspace", attempt: this.currentTaskAttempts });
-        if (this.currentTaskAttempts < this.policy.maxAttemptsPerTask) continue;
+        if (this.currentTaskAttempts < this.policy.maxAttemptsPerTask) {
+          if (await this.pauseBeforeRetry(task, this.currentWorkspace, reviewFindings)) return;
+          continue;
+        }
         await this.blockTask(task, `Workspace commit validation failed: ${reason}`);
         return;
       }
@@ -488,7 +498,10 @@ export class ControllerCore {
         await this.append("VERIFICATION_FINISHED", task.number, "verification finished", safeEvidence.map((item) => item.id), { passed: requiredEvidencePassed(safeEvidence, this.policy.verification), evidence: safeEvidence });
       }
       if (!requiredEvidencePassed(safeEvidence, this.policy.verification)) {
-        if (this.currentTaskAttempts < this.policy.maxAttemptsPerTask) continue;
+        if (this.currentTaskAttempts < this.policy.maxAttemptsPerTask) {
+          if (await this.pauseBeforeRetry(task, this.currentWorkspace, reviewFindings)) return;
+          continue;
+        }
         await this.blockTask(task, "required verification failed");
         return;
       }
@@ -509,7 +522,10 @@ export class ControllerCore {
         if (signal.aborted) throw error;
         const reason = error instanceof Error ? error.message : String(error);
         await this.append("TASK_FAILED", task.number, reason, safeEvidence.map((item) => item.id), { phase: "review", attempt: this.currentTaskAttempts });
-        if (this.currentTaskAttempts < this.policy.maxAttemptsPerTask) continue;
+        if (this.currentTaskAttempts < this.policy.maxAttemptsPerTask) {
+          if (await this.pauseBeforeRetry(task, this.currentWorkspace, reviewFindings)) return;
+          continue;
+        }
         await this.blockTask(task, `review execution failed: ${reason}`);
         return;
       }
@@ -518,13 +534,17 @@ export class ControllerCore {
         await this.append("REVIEW_FINISHED", task.number, "review finished", safeEvidence.map((item) => item.id), { disposition: review.disposition, result: review });
       }
       if (review.disposition === "changes_requested") {
-        this.retryFindings = review.findings.map((finding) => sanitizeText(finding, this.policy.secrets ?? []));
+        reviewFindings = review.findings.map((finding) => sanitizeText(finding, this.policy.secrets ?? []));
+        this.retryFindings = reviewFindings;
         if (this.pauseRequested) {
           this.recovery = { taskNumber: task.number, task, workspace: this.currentWorkspace, attempts: this.currentTaskAttempts, phase: "worker", reviewFindings: this.retryFindings };
           await this.stop("PAUSED_BY_USER", "pause requested after review feedback", true);
           return;
         }
-        if (this.currentTaskAttempts < this.policy.maxAttemptsPerTask) continue;
+        if (this.currentTaskAttempts < this.policy.maxAttemptsPerTask) {
+          if (await this.pauseBeforeRetry(task, this.currentWorkspace, reviewFindings)) return;
+          continue;
+        }
         await this.blockTask(task, `review requested changes: ${review.findings.join(", ")}`);
         return;
       }
@@ -648,6 +668,13 @@ export class ControllerCore {
     };
     this.eventBuffer.push(event);
     await this.adapters.journal.append(event);
+  }
+
+  private async pauseBeforeRetry(task: Task, workspace: Workspace, reviewFindings?: string[]): Promise<boolean> {
+    if (!this.pauseRequested) return false;
+    this.recovery = { taskNumber: task.number, task, workspace, attempts: this.currentTaskAttempts, phase: "worker", reviewFindings };
+    await this.stop("PAUSED_BY_USER", "pause requested before retry", true);
+    return true;
   }
 
   private async pauseAtCheckpoint(task: Task, workspace: Workspace, attempts: number, worker: WorkerResult, evidence: Evidence[], _commit: string | undefined): Promise<boolean> {

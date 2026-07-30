@@ -75,6 +75,17 @@ test("creates a safe isolated Git Worktree from a clean repository", async () =>
   }
 });
 
+test("redacts generic credential patterns before persisting verification output", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "controller-redact-"));
+  try {
+    const commands: CommandRunner = { run: async () => ({ stdout: "token=TOPSECRET", stderr: "", code: 0, killed: false }) };
+    const runner = new LocalVerificationRunner(dir, commands);
+    const evidence = await runner.run({ taskNumber: 3, path: dir, branch: "agent/task-3", baseBranch: "main" }, [{ name: "secret", command: "ignored", required: true }], new AbortController().signal);
+    assert.ok(!evidence[0]!.output.includes("TOPSECRET"));
+    assert.ok(!(await readFile(evidence[0]!.artifactPath!, "utf8")).includes("TOPSECRET"));
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
 test("keeps verification output bounded and stores the full artifact", async () => {
   const dir = await mkdtemp(join(tmpdir(), "controller-verify-"));
   try {

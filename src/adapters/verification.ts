@@ -63,7 +63,10 @@ export class LocalVerificationRunner implements VerificationRunner {
 function safeName(value: string): string { return value.replace(/[^a-zA-Z0-9._-]+/g, "-").slice(0, 80) || "command"; }
 
 function redact(value: string, secrets: string[]): string {
-  return secrets.filter(Boolean).reduce((result, secret) => result.split(secret).join("[REDACTED]"), value);
+  const common = value
+    .replace(/(api[_-]?key|token|password|secret|authorization)\s*([:=])\s*([^\s,;]+)/gi, "$1$2[REDACTED]")
+    .replace(/(bearer)\s+[a-z0-9._~+\/-]+=*/gi, "$1 [REDACTED]");
+  return secrets.filter(Boolean).reduce((result, secret) => result.split(secret).join("[REDACTED]"), common);
 }
 
 function truncate(value: string): string {
