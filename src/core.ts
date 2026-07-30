@@ -60,7 +60,7 @@ export class ControllerCore {
   private currentWorkspace?: Workspace;
   private currentTask?: Task;
   private currentTaskAttempts = 0;
-  private pendingMerge?: { task: Task; workspace: Workspace; commit?: string; evidence: Evidence[] };
+  private pendingMerge?: { task: Task; workspace: Workspace; commit?: string; evidence: Evidence[]; reviewDisposition?: ReviewResult["disposition"] };
   private leaseAcquired = false;
   private gateDecision?: string;
   private recovery?: RecoveryState;
@@ -68,7 +68,7 @@ export class ControllerCore {
   private recoveredFromJournal = false;
   private pendingGateTask?: Task;
   private pendingGateTaskNumber?: number;
-  private pendingFinalize?: { taskNumber: number; task?: Task; workspace: Workspace; commit?: string; evidence: Evidence[] };
+  private pendingFinalize?: { taskNumber: number; task?: Task; workspace: Workspace; commit?: string; evidence: Evidence[]; reviewDisposition?: ReviewResult["disposition"] };
   private orphanCleanup?: Workspace;
 
   constructor(projectRoot: string, policy: ControllerPolicy, adapters: ControllerAdapters, runId?: string, recovery?: RecoveryState) {
@@ -96,7 +96,8 @@ export class ControllerCore {
     if (!started) return undefined;
     const runEvents = events.slice(startIndex).filter((event) => event.runId === started.runId);
     const stopped = lastEvent(runEvents, (event) => event.type === "RUN_STOPPED");
-    if (stopped && stopped.data?.paused !== true) return undefined;
+    const cleanupFailed = lastEvent(runEvents, (event) => event.type === "TASK_CLEANUP_FAILED");
+    if (stopped && stopped.data?.paused !== true && !cleanupFailed) return undefined;
     const claimEvent = lastEvent(runEvents, (event) => event.type === "TASK_CLAIMED");
     const claimIntent = lastEvent(runEvents, (event) => event.type === "TASK_CLAIMING");
     const completedEvent = lastEvent(runEvents, (event) => event.type === "TASK_COMPLETED");
@@ -125,7 +126,10 @@ export class ControllerCore {
         const kind = gateEvent.data?.kind === "merge" ? "merge" : "task";
         core.recoveredGate = { id: gateId, kind, reason: gateEvent.reason ?? "recovered Human Gate", options: Array.isArray(gateEvent.data?.options) ? gateEvent.data.options.map(String) : ["allow", "reject"], recommendation: typeof gateEvent.data?.recommendation === "string" ? gateEvent.data.recommendation : undefined, evidenceIds: gateEvent.evidenceIds ?? [], status: "pending" };
         const gateTask = gateEvent.data?.task && typeof gateEvent.data.task === "object" ? gateEvent.data.task as Task : claimedTask;
-        if (gateTask) core.currentTask = gateTask;
+        if (gateTask) {
+          core.currentTask = gateTask;
+          if (kind === "task") core.pendingGateTask = gateTask;
+        }
         if (kind === "task" && gateEvent.taskNumber !== undefined) core.pendingGateTaskNumber = gateEvent.taskNumber;
       } else if (gateEvent && resolvedGate && resolvedGate.at >= gateEvent.at && gateEvent.data?.kind === "task" && (resolvedGate.data?.decision === "allow" || resolvedGate.reason === "allow")) {
         core.gateDecision = "allow";
@@ -153,7 +157,10 @@ export class ControllerCore {
       const kind = gateEvent.data?.kind === "merge" ? "merge" : "task";
       core.recoveredGate = { id: gateId, kind, reason: gateEvent.reason ?? "recovered Human Gate", options: Array.isArray(gateEvent.data?.options) ? gateEvent.data.options.map(String) : ["allow", "reject"], recommendation: typeof gateEvent.data?.recommendation === "string" ? gateEvent.data.recommendation : undefined, evidenceIds: gateEvent.evidenceIds ?? [], status: "pending" };
       const gateTask = gateEvent.data?.task && typeof gateEvent.data.task === "object" ? gateEvent.data.task as Task : claimedTask;
-      if (gateTask) core.currentTask = gateTask;
+      if (gateTask) {
+        core.currentTask = gateTask;
+        if (kind === "task") core.pendingGateTask = gateTask;
+      }
       if (kind === "task" && gateEvent.taskNumber !== undefined) core.pendingGateTaskNumber = gateEvent.taskNumber;
     }
     const mergedEvent = lastEvent(runEvents, (event) => event.type === "TASK_MERGED" && event.taskNumber === taskNumber);
@@ -167,10 +174,10 @@ export class ControllerCore {
     const review = reviewEvent?.data?.result as ReviewResult | undefined;
     const gateKind = gateEvent?.data?.kind;
     if (mergedEvent && !completedAfterMerge) {
-      core.pendingFinalize = { taskNumber, task: claimedTask, workspace: { taskNumber, path: String(workspaceEvent.data.path), branch: String(workspaceEvent.data.branch), baseBranch: String(workspaceEvent.data.baseBranch) }, commit: typeof mergedEvent.data?.commit === "string" ? mergedEvent.data.commit : undefined, evidence };
+      core.pendingFinalize = { taskNumber, task: claimedTask, workspace: { taskNumber, path: String(workspaceEvent.data.path), branch: String(workspaceEvent.data.branch), baseBranch: String(workspaceEvent.data.baseBranch) }, commit: typeof mergedEvent.data?.commit === "string" ? mergedEvent.data.commit : undefined, evidence, reviewDisposition: review?.disposition };
       core.recovery = undefined;
     } else if (gateKind === "merge" && core.recoveredGate && claimedTask) {
-      core.pendingMerge = { task: claimedTask, workspace: { taskNumber, path: String(workspaceEvent.data.path), branch: String(workspaceEvent.data.branch), baseBranch: String(workspaceEvent.data.baseBranch) }, commit: worker?.commit, evidence };
+      core.pendingMerge = { task: claimedTask, workspace: { taskNumber, path: String(workspaceEvent.data.path), branch: String(workspaceEvent.data.branch), baseBranch: String(workspaceEvent.data.baseBranch) }, commit: worker?.commit, evidence, reviewDisposition: review?.disposition };
       core.recovery = undefined;
     } else if (review?.disposition === "approved") {
       core.recovery = { taskNumber, task: claimedTask, attempts: runEvents.slice(claimIndex + 1).filter((event) => event.type === "EXECUTION_STARTED").length, phase: "merge", claimRequired: Boolean(activeIntent), mergeApproved: gateKind === "merge" && Boolean(resolvedGate && resolvedGate.at >= (gateEvent?.at ?? 0) && (resolvedGate.data?.decision === "allow" || resolvedGate.reason === "allow")), worker, evidence, review, workspace: { taskNumber, path: String(workspaceEvent.data.path), branch: String(workspaceEvent.data.branch), baseBranch: String(workspaceEvent.data.baseBranch) } };
@@ -307,7 +314,7 @@ export class ControllerCore {
             await this.stop("BLOCKED", `merged Workspace for Task #${pending.taskNumber} is stale or missing`);
             break;
           }
-          await this.finalizeMergedTask(task, pending.workspace, pending.commit, pending.evidence);
+          await this.finalizeMergedTask(task, pending.workspace, pending.commit, pending.evidence, pending.reviewDisposition);
           this.currentTask = undefined;
           this.currentWorkspace = undefined;
           continue;
@@ -323,7 +330,7 @@ export class ControllerCore {
             await this.stop("BLOCKED", `merge Workspace for Task #${pending.task.number} is stale or missing`);
             break;
           }
-          await this.completeMergedTask(pending.task, pending.workspace, pending.commit, pending.evidence);
+          await this.completeMergedTask(pending.task, pending.workspace, pending.commit, pending.evidence, pending.reviewDisposition);
           this.currentTask = undefined;
           this.currentWorkspace = undefined;
           continue;
@@ -556,7 +563,7 @@ export class ControllerCore {
         return;
       }
 
-      const pendingMerge = { task, workspace: this.currentWorkspace, commit, evidence: safeEvidence };
+      const pendingMerge = { task, workspace: this.currentWorkspace, commit, evidence: safeEvidence, reviewDisposition: review.disposition };
       const mergeGateRequired = !this.policy.autoMerge || this.policy.requireHumanForMerge || this.policy.protectedBranches.includes(this.policy.baseBranch);
       if (mergeGateRequired && checkpointState?.mergeApproved !== true) {
         this.pendingMerge = pendingMerge;
@@ -569,12 +576,12 @@ export class ControllerCore {
         return;
       }
 
-      await this.completeMergedTask(task, this.currentWorkspace, commit, evidence);
+      await this.completeMergedTask(task, this.currentWorkspace, commit, evidence, review.disposition);
       return;
     }
   }
 
-  private async completeMergedTask(task: Task, workspace: Workspace, commit: string | undefined, evidence: Evidence[]): Promise<void> {
+  private async completeMergedTask(task: Task, workspace: Workspace, commit: string | undefined, evidence: Evidence[], reviewDisposition?: ReviewResult["disposition"]): Promise<void> {
     this.runValue.phase = "MERGING";
     this.currentTask = { ...task, state: "MERGING" };
     let merged: { commit?: string };
@@ -585,11 +592,11 @@ export class ControllerCore {
       return;
     }
     await this.append("TASK_MERGED", task.number, "task merged", evidence.map((item) => item.id), { commit: merged.commit });
-    await this.finalizeMergedTask(task, workspace, merged.commit ?? commit, evidence);
+    await this.finalizeMergedTask(task, workspace, merged.commit ?? commit, evidence, reviewDisposition);
   }
 
-  private async finalizeMergedTask(task: Task, workspace: Workspace, commit: string | undefined, evidence: Evidence[]): Promise<void> {
-    const comment = `Controller Run ${this.runId} completed this Task.\n\nCommit: ${commit ?? "unknown"}\nVerification: ${evidence.map((item) => `${item.name}=${item.success ? "passed" : "failed"}`).join(", ") || "none"}`;
+  private async finalizeMergedTask(task: Task, workspace: Workspace, commit: string | undefined, evidence: Evidence[], reviewDisposition?: ReviewResult["disposition"]): Promise<void> {
+    const comment = `Controller Run ${this.runId} completed this Task.\n\nCommit: ${commit ?? "unknown"}\nReview: ${reviewDisposition ?? "unknown"}\nVerification: ${evidence.map((item) => `${item.name}=${item.success ? "passed" : "failed"}`).join(", ") || "none"}`;
     await this.adapters.tasks.complete(task, this.runId, this.policy.doneLabel, comment, `${this.runId}:task:${task.number}:done`);
     await this.append("TASK_COMPLETED", task.number, "task completed", evidence.map((item) => item.id), { commit });
     this.runValue.usage.completedTasks += 1;
@@ -707,7 +714,7 @@ export class ControllerCore {
     await this.append("LEASE_RELEASED", undefined, "lease released");
   }
 
-  private addUsage(role: Exclude<AgentRole, "architect">, usage: { input: number; output: number; cacheRead: number; cacheWrite: number; totalTokens: number; cost: number; turns: number }): void {
+  private addUsage(role: AgentRole, usage: { input: number; output: number; cacheRead: number; cacheWrite: number; totalTokens: number; cost: number; turns: number }): void {
     this.runValue.usage.tokens += usage.totalTokens;
     this.runValue.usage.cost += usage.cost;
     const roleUsage = this.runValue.usage.roleUsage[role];

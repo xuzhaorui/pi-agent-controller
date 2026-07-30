@@ -40,13 +40,13 @@ export class GitHubIssueTracker implements TaskTracker {
   }
 
   async claim(task: Task, runId: string, label: string, marker: string): Promise<void> {
-    await this.updateLabels(task.number, [label], [this.policy.readinessLabel]);
     await this.commentOnce(task.number, marker, `Controller Run ${runId} claimed Task #${task.number}.\n\nMarker: ${marker}`);
+    await this.updateLabels(task.number, [label], [this.policy.readinessLabel]);
   }
 
   async markReview(task: Task, runId: string, label: string, marker: string): Promise<void> {
-    await this.updateLabels(task.number, [label], [this.policy.inProgressLabel]);
     await this.commentOnce(task.number, marker, `Controller Run ${runId} started review for Task #${task.number}.\n\nMarker: ${marker}`);
+    await this.updateLabels(task.number, [label], [this.policy.inProgressLabel]);
   }
 
   async complete(task: Task, runId: string, label: string, comment: string, marker: string): Promise<void> {
@@ -62,8 +62,8 @@ export class GitHubIssueTracker implements TaskTracker {
   }
 
   async block(task: Task, runId: string, label: string, comment: string, marker: string): Promise<void> {
-    await this.updateLabels(task.number, [label], [this.policy.inProgressLabel, this.policy.reviewLabel]);
     await this.commentOnce(task.number, marker, `Controller Run ${runId} blocked Task #${task.number}.\n\n${comment}\n\nMarker: ${marker}`);
+    await this.updateLabels(task.number, [label], [this.policy.inProgressLabel, this.policy.reviewLabel]);
   }
 
   private async updateLabels(number: number, add: string[], remove: string[]): Promise<void> {
