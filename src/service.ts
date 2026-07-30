@@ -80,7 +80,7 @@ export class ControllerService {
     const gitPathResult = await commands.run("git", ["rev-parse", "--git-path", "agent-controller"], { cwd: projectRoot, timeoutMs: 10_000 });
     if (gitPathResult.code !== 0) throw new Error("cannot resolve Git metadata directory");
     const stateRoot = resolve(projectRoot, gitPathResult.stdout.trim());
-    const tasks = new GitHubIssueTracker(repo, policy, commands);
+    const tasks = new GitHubIssueTracker(repo, policy, commands, policy.secrets ?? []);
     this.projectRoot = projectRoot;
     this.policy = policy;
     return {
@@ -91,7 +91,7 @@ export class ControllerService {
         tasks,
         workspaces: new GitWorkspaceManager(projectRoot, commands),
         agents: new PiProcessAgentRuntime(),
-        verification: new LocalVerificationRunner(),
+        verification: new LocalVerificationRunner(undefined, commands, policy.secrets ?? []),
         journal: new FileJournal(resolve(stateRoot, "run-journal.jsonl")),
         lease: new FileRepositoryLease(resolve(stateRoot, "lease.json")),
       },

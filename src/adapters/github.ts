@@ -15,6 +15,7 @@ export class GitHubIssueTracker implements TaskTracker {
     private readonly repo: string,
     private readonly policy: ControllerPolicy,
     private readonly commands: CommandRunner = new LocalCommandRunner(),
+    private readonly secrets: string[] = policy.secrets ?? [],
   ) {}
 
   async listOpenTasks(): Promise<Task[]> {
@@ -77,9 +78,13 @@ export class GitHubIssueTracker implements TaskTracker {
     const existing = await this.commands.run("gh", ["api", "--paginate", `repos/${this.repo}/issues/${number}/comments`, "--jq", ".[].body"], { timeoutMs: 30_000 });
     if (existing.code !== 0) throw new Error(`failed to inspect comments for GitHub Issue #${number}: ${existing.stderr.trim()}`);
     if (existing.stdout.includes(marker)) return;
-    const result = await this.commands.run("gh", ["issue", "comment", String(number), "--repo", this.repo, "--body", body], { timeoutMs: 30_000 });
+    const result = await this.commands.run("gh", ["issue", "comment", String(number), "--repo", this.repo, "--body", redact(body, this.secrets)], { timeoutMs: 30_000 });
     if (result.code !== 0) throw new Error(`failed to comment on GitHub Issue #${number}: ${result.stderr.trim()}`);
   }
+}
+
+function redact(value: string, secrets: string[]): string {
+  return secrets.filter(Boolean).reduce((result, secret) => result.split(secret).join("[REDACTED]"), value);
 }
 
 export function parseGitHubRepo(remote: string): string | undefined {

@@ -54,6 +54,12 @@ export class GitWorkspaceManager implements WorkspaceManager {
   }
 
   async commit(_task: Task, workspace: Workspace): Promise<string | undefined> {
+    const status = await this.commands.run("git", ["status", "--porcelain"], { cwd: workspace.path, timeoutMs: 10_000 });
+    if (status.code !== 0) throw new Error(`cannot inspect Worker Workspace: ${status.stderr.trim()}`);
+    if (status.stdout.trim()) throw new Error("Worker left uncommitted changes in the Workspace");
+    const diff = await this.commands.run("git", ["diff", "--quiet", `${workspace.baseBranch}...HEAD`], { cwd: workspace.path, timeoutMs: 30_000 });
+    if (diff.code === 0) throw new Error("Worker produced no committed changes");
+    if (diff.code !== 1) throw new Error(`cannot inspect committed Workspace diff: ${diff.stderr.trim()}`);
     const result = await this.commands.run("git", ["log", "-1", "--format=%H"], { cwd: workspace.path, timeoutMs: 10_000 });
     return result.code === 0 ? result.stdout.trim() || undefined : undefined;
   }

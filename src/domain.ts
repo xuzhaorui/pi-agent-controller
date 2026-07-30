@@ -86,6 +86,7 @@ export interface ControllerPolicy {
   guardedPathPatterns: string[];
   cleanupOnSuccess: boolean;
   cleanupOnFailure: boolean;
+  secrets?: string[];
 }
 
 export interface RunBudgetUsage {
@@ -312,6 +313,7 @@ export function defaultPolicy(): ControllerPolicy {
     guardedPathPatterns: [".env", "production", "schema", "migration"],
     cleanupOnSuccess: true,
     cleanupOnFailure: false,
+    secrets: [],
   };
 }
 
