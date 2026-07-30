@@ -188,6 +188,7 @@ export interface HumanGate {
 
 export type JournalEventType =
   | "RUN_STARTED"
+  | "RUN_RESUMED"
   | "RUN_STOPPED"
   | "TASK_DISCOVERED"
   | "TASK_CLAIMING"

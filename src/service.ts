@@ -47,7 +47,7 @@ export class ControllerService {
   status(): Run | undefined { return this.core?.snapshot ?? this.lastResult?.run; }
 
   async shutdown(): Promise<void> {
-    await this.core?.stopNow();
+    await this.core?.shutdown();
     await this.running;
     this.running = undefined;
     this.core = undefined;

@@ -32,6 +32,7 @@ type RecoveryState = {
   attempts: number;
   phase: "worker" | "verification" | "review" | "merge";
   claimRequired?: boolean;
+  mergeApproved?: boolean;
   worker?: WorkerResult;
   evidence?: Evidence[];
   review?: ReviewResult;
@@ -57,6 +58,7 @@ export class ControllerCore {
   private gateDecision?: string;
   private recovery?: RecoveryState;
   private recoveredGate?: HumanGate;
+  private recoveredFromJournal = false;
   private pendingGateTask?: Task;
   private pendingGateTaskNumber?: number;
   private pendingFinalize?: { taskNumber: number; task?: Task; workspace: Workspace; commit?: string; evidence: Evidence[] };
@@ -100,6 +102,7 @@ export class ControllerCore {
     if (taskNumber === undefined || !workspaceEvent?.data?.path || !workspaceEvent.data.branch || !workspaceEvent.data.baseBranch) {
       const core = new ControllerCore(projectRoot, policy, adapters, started.runId);
       core.eventBuffer.push(...runEvents);
+      core.recoveredFromJournal = true;
       core.runValue.startedAt = started.at;
       core.runValue.usage.startedAt = started.at;
       core.restoreRunUsage(runEvents);
@@ -132,6 +135,7 @@ export class ControllerCore {
       workspace: { taskNumber, path: String(workspaceEvent.data.path), branch: String(workspaceEvent.data.branch), baseBranch: String(workspaceEvent.data.baseBranch) },
     });
     core.eventBuffer.push(...runEvents);
+    core.recoveredFromJournal = true;
     core.runValue.startedAt = started.at;
     core.runValue.usage.startedAt = started.at;
     core.restoreRunUsage(runEvents);
@@ -162,11 +166,11 @@ export class ControllerCore {
       core.pendingMerge = { task: claimedTask, workspace: { taskNumber, path: String(workspaceEvent.data.path), branch: String(workspaceEvent.data.branch), baseBranch: String(workspaceEvent.data.baseBranch) }, commit: worker?.commit, evidence };
       core.recovery = undefined;
     } else if (review?.disposition === "approved") {
-      core.recovery = { taskNumber, task: claimedTask, attempts: runEvents.slice(claimIndex + 1).filter((event) => event.type === "EXECUTION_STARTED").length, phase: "merge", claimRequired: Boolean(activeIntent), worker, evidence, review, workspace: { taskNumber, path: String(workspaceEvent.data.path), branch: String(workspaceEvent.data.branch), baseBranch: String(workspaceEvent.data.baseBranch) } };
+      core.recovery = { taskNumber, task: claimedTask, attempts: runEvents.slice(claimIndex + 1).filter((event) => event.type === "EXECUTION_STARTED").length, phase: "merge", claimRequired: Boolean(activeIntent), mergeApproved: gateKind === "merge" && Boolean(resolvedGate && resolvedGate.at >= (gateEvent?.at ?? 0) && (resolvedGate.data?.decision === "allow" || resolvedGate.reason === "allow")), worker, evidence, review, workspace: { taskNumber, path: String(workspaceEvent.data.path), branch: String(workspaceEvent.data.branch), baseBranch: String(workspaceEvent.data.baseBranch) } };
     } else if (verification?.data?.passed === true) {
       core.recovery = { taskNumber, task: claimedTask, attempts: runEvents.slice(claimIndex + 1).filter((event) => event.type === "EXECUTION_STARTED").length, phase: "review", claimRequired: Boolean(activeIntent), worker, evidence, workspace: { taskNumber, path: String(workspaceEvent.data.path), branch: String(workspaceEvent.data.branch), baseBranch: String(workspaceEvent.data.baseBranch) } };
     } else if (worker?.outcome === "completed") {
-      core.recovery = { taskNumber, task: claimedTask, attempts: runEvents.slice(claimIndex + 1).filter((event) => event.type === "EXECUTION_STARTED").length, phase: "verification", worker, workspace: { taskNumber, path: String(workspaceEvent.data.path), branch: String(workspaceEvent.data.branch), baseBranch: String(workspaceEvent.data.baseBranch) } };
+      core.recovery = { taskNumber, task: claimedTask, attempts: runEvents.slice(claimIndex + 1).filter((event) => event.type === "EXECUTION_STARTED").length, phase: "verification", claimRequired: Boolean(activeIntent), worker, workspace: { taskNumber, path: String(workspaceEvent.data.path), branch: String(workspaceEvent.data.branch), baseBranch: String(workspaceEvent.data.baseBranch) } };
     } else {
       const attempts = runEvents.slice(claimIndex + 1).filter((event) => event.type === "EXECUTION_STARTED").length;
       core.recovery = { taskNumber, task: claimedTask, attempts: Math.max(0, attempts - 1), phase: "worker", claimRequired: Boolean(activeIntent), workspace: { taskNumber, path: String(workspaceEvent.data.path), branch: String(workspaceEvent.data.branch), baseBranch: String(workspaceEvent.data.baseBranch) } };
@@ -345,6 +349,14 @@ export class ControllerCore {
     return this.result(this.eventBuffer.slice(startedEventCount));
   }
 
+  async shutdown(): Promise<void> {
+    if (this.state === "active") {
+      await this.stopNow();
+      return;
+    }
+    await this.releaseLease();
+  }
+
   async pause(): Promise<void> {
     // Do not change state or abort the current action here. The Reconcile Loop
     // observes this flag after the current Worker/Verification/Review checkpoint.
@@ -386,7 +398,7 @@ export class ControllerCore {
       return;
     }
     await this.append("LEASE_ACQUIRED", undefined, "lease acquired");
-    await this.append("RUN_STARTED", undefined, "run started");
+    await this.append(this.recoveredFromJournal ? "RUN_RESUMED" : "RUN_STARTED", undefined, this.recoveredFromJournal ? "run resumed" : "run started");
   }
 
   private async executeTask(task: Task, signal: AbortSignal, recovery?: RecoveryState): Promise<void> {
@@ -500,7 +512,8 @@ export class ControllerCore {
       }
 
       const pendingMerge = { task, workspace: this.currentWorkspace, commit, evidence };
-      if (!this.policy.autoMerge || this.policy.requireHumanForMerge || this.policy.protectedBranches.includes(this.policy.baseBranch)) {
+      const mergeGateRequired = !this.policy.autoMerge || this.policy.requireHumanForMerge || this.policy.protectedBranches.includes(this.policy.baseBranch);
+      if (mergeGateRequired && checkpointState?.mergeApproved !== true) {
         this.pendingMerge = pendingMerge;
         await this.createHumanGate(task, "merge requires human approval", ["allow", "reject"], "allow", "merge");
         return;
