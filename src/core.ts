@@ -156,7 +156,7 @@ export class ControllerCore {
     const execution = lastEvent(runEvents, (event) => event.type === "EXECUTION_FINISHED" && event.taskNumber === taskNumber);
     const worker = execution?.data?.result as WorkerResult | undefined;
     const verification = lastEvent(runEvents, (event) => event.type === "VERIFICATION_FINISHED" && event.taskNumber === taskNumber);
-    const evidence = Array.isArray(verification?.data?.evidence) ? verification.data.evidence as Evidence[] : [];
+    const evidence = (Array.isArray(verification?.data?.evidence) ? verification.data.evidence as Evidence[] : []).map((item) => sanitizeEvidence(item, policy.secrets ?? []));
     if (evidence.length > 0) core.evidence.push(...evidence);
     const reviewEvent = lastEvent(runEvents, (event) => event.type === "REVIEW_FINISHED" && event.taskNumber === taskNumber);
     const review = reviewEvent?.data?.result as ReviewResult | undefined;
@@ -482,16 +482,17 @@ export class ControllerCore {
       this.currentTask = { ...task, state: "VERIFYING" };
       const restoredEvidence = checkpointState && (checkpointState.phase === "review" || checkpointState.phase === "merge") ? checkpointState.evidence : undefined;
       const evidence = restoredEvidence ?? await this.adapters.verification.run(this.currentWorkspace, this.policy.verification, signal);
+      const safeEvidence = evidence.map((item) => sanitizeEvidence(item, this.policy.secrets ?? []));
       if (!restoredEvidence) {
-        this.evidence.push(...evidence);
-        await this.append("VERIFICATION_FINISHED", task.number, "verification finished", evidence.map((item) => item.id), { passed: requiredEvidencePassed(evidence, this.policy.verification), evidence });
+        this.evidence.push(...safeEvidence);
+        await this.append("VERIFICATION_FINISHED", task.number, "verification finished", safeEvidence.map((item) => item.id), { passed: requiredEvidencePassed(safeEvidence, this.policy.verification), evidence: safeEvidence });
       }
-      if (!requiredEvidencePassed(evidence, this.policy.verification)) {
+      if (!requiredEvidencePassed(safeEvidence, this.policy.verification)) {
         if (this.currentTaskAttempts < this.policy.maxAttemptsPerTask) continue;
         await this.blockTask(task, "required verification failed");
         return;
       }
-      if (await this.pauseAtCheckpoint(task, this.currentWorkspace, this.currentTaskAttempts, worker, evidence, commit)) return;
+      if (await this.pauseAtCheckpoint(task, this.currentWorkspace, this.currentTaskAttempts, worker, safeEvidence, commit)) return;
 
       this.runValue.phase = "REVIEWING";
       this.currentTask = { ...task, state: "REVIEWING" };
@@ -502,24 +503,24 @@ export class ControllerCore {
           review = restoredReview;
         } else {
           await this.adapters.tasks.markReview(task, this.runId, this.policy.reviewLabel, `${this.runId}:task:${task.number}:review`);
-          review = await this.executeAgent("reviewer", task, this.currentWorkspace, signal, evidence) as ReviewResult;
+          review = await this.executeAgent("reviewer", task, this.currentWorkspace, signal, safeEvidence) as ReviewResult;
         }
       } catch (error) {
         if (signal.aborted) throw error;
         const reason = error instanceof Error ? error.message : String(error);
-        await this.append("TASK_FAILED", task.number, reason, evidence.map((item) => item.id), { phase: "review", attempt: this.currentTaskAttempts });
+        await this.append("TASK_FAILED", task.number, reason, safeEvidence.map((item) => item.id), { phase: "review", attempt: this.currentTaskAttempts });
         if (this.currentTaskAttempts < this.policy.maxAttemptsPerTask) continue;
         await this.blockTask(task, `review execution failed: ${reason}`);
         return;
       }
       if (!restoredReview) {
         this.addUsage(review.usage);
-        await this.append("REVIEW_FINISHED", task.number, "review finished", evidence.map((item) => item.id), { disposition: review.disposition, result: review });
+        await this.append("REVIEW_FINISHED", task.number, "review finished", safeEvidence.map((item) => item.id), { disposition: review.disposition, result: review });
       }
       if (review.disposition === "changes_requested") {
-        this.retryFindings = review.findings;
+        this.retryFindings = review.findings.map((finding) => sanitizeText(finding, this.policy.secrets ?? []));
         if (this.pauseRequested) {
-          this.recovery = { taskNumber: task.number, task, workspace: this.currentWorkspace, attempts: this.currentTaskAttempts, phase: "worker", reviewFindings: review.findings };
+          this.recovery = { taskNumber: task.number, task, workspace: this.currentWorkspace, attempts: this.currentTaskAttempts, phase: "worker", reviewFindings: this.retryFindings };
           await this.stop("PAUSED_BY_USER", "pause requested after review feedback", true);
           return;
         }
@@ -532,7 +533,7 @@ export class ControllerCore {
         return;
       }
 
-      const pendingMerge = { task, workspace: this.currentWorkspace, commit, evidence };
+      const pendingMerge = { task, workspace: this.currentWorkspace, commit, evidence: safeEvidence };
       const mergeGateRequired = !this.policy.autoMerge || this.policy.requireHumanForMerge || this.policy.protectedBranches.includes(this.policy.baseBranch);
       if (mergeGateRequired && checkpointState?.mergeApproved !== true) {
         this.pendingMerge = pendingMerge;
@@ -641,9 +642,9 @@ export class ControllerCore {
       runId: this.runId,
       ...(taskNumber !== undefined ? { taskNumber } : {}),
       phase: this.runValue.phase,
-      ...(reason ? { reason } : {}),
+      ...(reason ? { reason: sanitizeText(reason, this.policy.secrets ?? []) } : {}),
       ...(evidenceIds && evidenceIds.length > 0 ? { evidenceIds } : {}),
-      ...(data ? { data: sanitizeRecord(data) } : {}),
+      ...(data ? { data: sanitizeRecord(data, this.policy.secrets ?? []) } : {}),
     };
     this.eventBuffer.push(event);
     await this.adapters.journal.append(event);
@@ -694,21 +695,33 @@ export class ControllerCore {
   }
 }
 
-function sanitizeRecord(data: Record<string, unknown>): Record<string, unknown> {
-  return sanitizeValue(data) as Record<string, unknown>;
+function sanitizeRecord(data: Record<string, unknown>, secrets: string[]): Record<string, unknown> {
+  return sanitizeValue(data, secrets) as Record<string, unknown>;
 }
 
-function sanitizeValue(value: unknown): unknown {
-  if (typeof value === "string") {
-    return value
-      .replace(/(api[_-]?key|token|password|secret|authorization)\s*([:=])\s*([^\s,;]+)/gi, "$1$2[REDACTED]")
-      .replace(/(bearer)\s+[a-z0-9._~+\/-]+=*/gi, "$1 [REDACTED]");
-  }
-  if (Array.isArray(value)) return value.map(sanitizeValue);
+function sanitizeText(value: string, secrets: string[]): string {
+  const common = value
+    .replace(/(api[_-]?key|token|password|secret|authorization)\s*([:=])\s*([^\s,;]+)/gi, "$1$2[REDACTED]")
+    .replace(/(bearer)\s+[a-z0-9._~+\/-]+=*/gi, "$1 [REDACTED]");
+  return secrets.filter(Boolean).reduce((result, secret) => result.split(secret).join("[REDACTED]"), common);
+}
+
+function sanitizeValue(value: unknown, secrets: string[]): unknown {
+  if (typeof value === "string") return sanitizeText(value, secrets);
+  if (Array.isArray(value)) return value.map((item) => sanitizeValue(item, secrets));
   if (value && typeof value === "object") {
-    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, sanitizeValue(item)]));
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, sanitizeValue(item, secrets)]));
   }
   return value;
+}
+
+function sanitizeEvidence(evidence: Evidence, secrets: string[]): Evidence {
+  return {
+    ...evidence,
+    output: sanitizeText(evidence.output, secrets),
+    ...(evidence.artifactPath ? { artifactPath: sanitizeText(evidence.artifactPath, secrets) } : {}),
+    metadata: sanitizeValue(evidence.metadata, secrets) as Evidence["metadata"],
+  };
 }
 
 function limitContext(value: string): string {
