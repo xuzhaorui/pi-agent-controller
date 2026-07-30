@@ -83,10 +83,23 @@ export class GitWorkspaceManager implements WorkspaceManager {
   async cleanup(workspace: Workspace, policy: ControllerPolicy, success: boolean): Promise<void> {
     if ((success && !policy.cleanupOnSuccess) || (!success && !policy.cleanupOnFailure)) return;
     const removed = await this.commands.run("git", ["worktree", "remove", workspace.path], { cwd: this.projectRoot, timeoutMs: 30_000 });
-    if (removed.code !== 0) throw new Error(`failed to remove Workspace: ${removed.stderr.trim()}`);
+    if (removed.code !== 0) {
+      const listed = await this.commands.run("git", ["worktree", "list", "--porcelain"], { cwd: this.projectRoot, timeoutMs: 10_000 });
+      if (listed.stdout.split(/\r?\n/).includes(`worktree ${workspace.path}`)) {
+        try { await stat(workspace.path); throw new Error(`failed to remove Workspace: ${removed.stderr.trim()}`); }
+        catch (error) {
+          if (error instanceof Error && error.message.startsWith("failed to remove Workspace")) throw error;
+          const pruned = await this.commands.run("git", ["worktree", "prune"], { cwd: this.projectRoot, timeoutMs: 10_000 });
+          if (pruned.code !== 0) throw new Error(`failed to prune stale Workspace: ${pruned.stderr.trim()}`);
+        }
+      }
+    }
     if (success) {
       const deleted = await this.commands.run("git", ["branch", "-d", workspace.branch], { cwd: this.projectRoot, timeoutMs: 10_000 });
-      if (deleted.code !== 0) throw new Error(`failed to remove Workspace branch: ${deleted.stderr.trim()}`);
+      if (deleted.code !== 0) {
+        const branch = await this.commands.run("git", ["branch", "--list", workspace.branch], { cwd: this.projectRoot, timeoutMs: 10_000 });
+        if (branch.stdout.trim()) throw new Error(`failed to remove Workspace branch: ${deleted.stderr.trim()}`);
+      }
     }
   }
 }

@@ -101,7 +101,7 @@ export class ControllerService {
 
 function makePreviewRun(projectRoot: string): Run {
   const now = Date.now();
-  return { id: "dry-run", projectRoot, state: "STOPPED", phase: "DRY_RUN", usage: { completedTasks: 0, attempts: 0, tokens: 0, cost: 0, startedAt: now }, startedAt: now, updatedAt: now, stopReason: "BACKLOG_EMPTY" };
+  return { id: "dry-run", projectRoot, state: "STOPPED", phase: "DRY_RUN", usage: { completedTasks: 0, attempts: 0, tokens: 0, cost: 0, roleUsage: { worker: { input: 0, output: 0, tokens: 0, cost: 0, turns: 0 }, reviewer: { input: 0, output: 0, tokens: 0, cost: 0, turns: 0 }, architect: { input: 0, output: 0, tokens: 0, cost: 0, turns: 0 } }, startedAt: now }, startedAt: now, updatedAt: now, stopReason: "BACKLOG_EMPTY" };
 }
 
 export function statusText(run: Run | undefined): string {

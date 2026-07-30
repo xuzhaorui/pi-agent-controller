@@ -89,11 +89,20 @@ export interface ControllerPolicy {
   secrets?: string[];
 }
 
+export interface RoleUsage {
+  input: number;
+  output: number;
+  tokens: number;
+  cost: number;
+  turns: number;
+}
+
 export interface RunBudgetUsage {
   completedTasks: number;
   attempts: number;
   tokens: number;
   cost: number;
+  roleUsage: Record<AgentRole, RoleUsage>;
   startedAt: number;
 }
 

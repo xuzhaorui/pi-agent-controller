@@ -1,4 +1,5 @@
 import {
+  type AgentRole,
   type AgentRuntime,
   type ControllerAdapters,
   type ControllerPolicy,
@@ -9,6 +10,7 @@ import {
   JOURNAL_SCHEMA_VERSION,
   type ReviewResult,
   type ReconcileResult,
+  type RoleUsage,
   type Run,
   type StopReason,
   type Task,
@@ -21,7 +23,11 @@ import {
   validatePolicy,
 } from "./domain.js";
 
-const EMPTY_USAGE = { completedTasks: 0, attempts: 0, tokens: 0, cost: 0, startedAt: 0 } as const;
+function emptyRoleUsage(): RoleUsage { return { input: 0, output: 0, tokens: 0, cost: 0, turns: 0 }; }
+
+function createBudgetUsage(startedAt: number) {
+  return { completedTasks: 0, attempts: 0, tokens: 0, cost: 0, roleUsage: { worker: emptyRoleUsage(), reviewer: emptyRoleUsage(), architect: emptyRoleUsage() }, startedAt };
+}
 
 type ControllerState = "new" | "active" | "paused" | "stopped";
 
@@ -77,7 +83,7 @@ export class ControllerCore {
       projectRoot,
       state: "RUNNING",
       phase: "CREATED",
-      usage: { ...EMPTY_USAGE, startedAt: now },
+      usage: createBudgetUsage(now),
       startedAt: now,
       updatedAt: now,
     };
@@ -456,7 +462,7 @@ export class ControllerCore {
         return;
       }
       if (!restoredWorker) {
-        this.addUsage(worker.usage);
+        this.addUsage("worker", worker.usage);
         await this.append("EXECUTION_FINISHED", task.number, "worker finished", undefined, { outcome: worker.outcome, attempt: this.currentTaskAttempts, result: worker });
       }
 
@@ -528,7 +534,7 @@ export class ControllerCore {
         return;
       }
       if (!restoredReview) {
-        this.addUsage(review.usage);
+        this.addUsage("reviewer", review.usage);
         await this.append("REVIEW_FINISHED", task.number, "review finished", safeEvidence.map((item) => item.id), { disposition: review.disposition, result: review });
       }
       if (review.disposition === "changes_requested") {
@@ -592,6 +598,7 @@ export class ControllerCore {
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
       await this.append("TASK_CLEANUP_FAILED", task.number, reason, undefined, { workspace: workspace.path });
+      await this.stop("BLOCKED", `Task cleanup failed: ${reason}`);
     }
   }
 
@@ -700,19 +707,27 @@ export class ControllerCore {
     await this.append("LEASE_RELEASED", undefined, "lease released");
   }
 
-  private addUsage(usage: { totalTokens: number; cost: number }): void {
+  private addUsage(role: Exclude<AgentRole, "architect">, usage: { input: number; output: number; cacheRead: number; cacheWrite: number; totalTokens: number; cost: number; turns: number }): void {
     this.runValue.usage.tokens += usage.totalTokens;
     this.runValue.usage.cost += usage.cost;
+    const roleUsage = this.runValue.usage.roleUsage[role];
+    roleUsage.input += usage.input;
+    roleUsage.output += usage.output;
+    roleUsage.tokens += usage.totalTokens;
+    roleUsage.cost += usage.cost;
+    roleUsage.turns += usage.turns;
   }
 
   private restoreRunUsage(events: JournalEvent[]): void {
     this.runValue.usage.completedTasks = events.filter((event) => event.type === "TASK_COMPLETED").length;
     this.runValue.usage.attempts = events.filter((event) => event.type === "EXECUTION_STARTED").length;
     for (const event of events) {
-      const result = event.data?.result as { usage?: { totalTokens?: number; cost?: number } } | undefined;
-      if (result?.usage) {
-        this.runValue.usage.tokens += result.usage.totalTokens ?? 0;
-        this.runValue.usage.cost += result.usage.cost ?? 0;
+      const result = event.data?.result as { usage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; totalTokens?: number; cost?: number; turns?: number } } | undefined;
+      if (result?.usage && (event.type === "EXECUTION_FINISHED" || event.type === "REVIEW_FINISHED")) {
+        this.addUsage(event.type === "EXECUTION_FINISHED" ? "worker" : "reviewer", {
+          input: result.usage.input ?? 0, output: result.usage.output ?? 0, cacheRead: result.usage.cacheRead ?? 0,
+          cacheWrite: result.usage.cacheWrite ?? 0, totalTokens: result.usage.totalTokens ?? 0, cost: result.usage.cost ?? 0, turns: result.usage.turns ?? 0,
+        });
       }
     }
     this.runValue.updatedAt = events[events.length - 1]?.at ?? this.runValue.startedAt;
