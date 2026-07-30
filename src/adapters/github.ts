@@ -72,7 +72,8 @@ export class GitHubIssueTracker implements TaskTracker {
 
   private async commentOnce(number: number, marker: string, body: string): Promise<void> {
     const existing = await this.commands.run("gh", ["api", "--paginate", `repos/${this.repo}/issues/${number}/comments`, "--jq", ".[].body"], { timeoutMs: 30_000 });
-    if (existing.code === 0 && existing.stdout.includes(marker)) return;
+    if (existing.code !== 0) throw new Error(`failed to inspect comments for GitHub Issue #${number}: ${existing.stderr.trim()}`);
+    if (existing.stdout.includes(marker)) return;
     const result = await this.commands.run("gh", ["issue", "comment", String(number), "--repo", this.repo, "--body", body], { timeoutMs: 30_000 });
     if (result.code !== 0) throw new Error(`failed to comment on GitHub Issue #${number}: ${result.stderr.trim()}`);
   }

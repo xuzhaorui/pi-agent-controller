@@ -177,6 +177,7 @@ export interface Evidence {
 
 export interface HumanGate {
   id: string;
+  kind: "task" | "merge";
   reason: string;
   options: string[];
   recommendation?: string;
@@ -232,6 +233,7 @@ export interface WorkspaceManager {
   diff(workspace: Workspace): Promise<string>;
   merge(workspace: Workspace, policy: ControllerPolicy): Promise<{ commit?: string }>;
   cleanup(workspace: Workspace, policy: ControllerPolicy, success: boolean): Promise<void>;
+  validate?(workspace: Workspace): Promise<boolean>;
 }
 
 export interface AgentRuntime {

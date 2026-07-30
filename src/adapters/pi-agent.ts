@@ -28,7 +28,7 @@ export class PiProcessAgentRuntime implements AgentRuntime {
       if (child.killed) return;
       killed = true;
       child.kill("SIGTERM");
-      setTimeout(() => { if (!child.killed) child.kill("SIGKILL"); }, 5_000).unref();
+      setTimeout(() => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); }, 5_000).unref();
     };
     if (signal.aborted) kill(); else signal.addEventListener("abort", kill, { once: true });
     const parseLine = (line: string) => {
@@ -79,11 +79,9 @@ function systemPrompt(role: AgentRole): string {
 }
 
 function parseResult(text: string): WorkerResult | ReviewResult {
-  const start = text.indexOf("{");
-  const end = text.lastIndexOf("}");
-  if (start < 0 || end <= start) throw new Error("Agent did not return a JSON Result");
+  if (!text.trim()) throw new Error("Agent did not return a JSON Result");
   let value: any;
-  try { value = JSON.parse(text.slice(start, end + 1)); } catch { throw new Error("Agent returned malformed Result JSON"); }
+  try { value = JSON.parse(text.trim()); } catch { throw new Error("Agent returned malformed Result JSON"); }
   if (value?.schemaVersion !== 1 || !isUsage(value.usage) || !isStringArray(value.artifacts)) throw new Error("Agent Result failed schema validation");
   if ("outcome" in value && ["completed", "failed", "blocked", "needs_human"].includes(value.outcome) && isStringArray(value.changedFiles) && isStringArray(value.testsClaimed) && isStringArray(value.risks) && isStringArray(value.blockers) && ["verify", "retry", "blocked", "human"].includes(value.recommendedDisposition) && (value.commit === undefined || typeof value.commit === "string")) {
     return value as WorkerResult;

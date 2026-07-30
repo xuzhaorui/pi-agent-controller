@@ -92,8 +92,9 @@ export class ControllerCore {
       const resolvedGate = lastEvent(runEvents, (event) => event.type === "HUMAN_GATE_RESOLVED");
       if (gateEvent && (!resolvedGate || resolvedGate.at < gateEvent.at)) {
         const gateId = String(gateEvent.data?.gateId ?? `${started.runId}:recovered-gate`);
-        core.recoveredGate = { id: gateId, reason: gateEvent.reason ?? "recovered Human Gate", options: Array.isArray(gateEvent.data?.options) ? gateEvent.data.options.map(String) : ["allow", "reject"], evidenceIds: gateEvent.evidenceIds ?? [], status: "pending" };
-        if (gateEvent.taskNumber !== undefined) core.pendingGateTaskNumber = gateEvent.taskNumber;
+        const kind = gateEvent.data?.kind === "merge" ? "merge" : "task";
+        core.recoveredGate = { id: gateId, kind, reason: gateEvent.reason ?? "recovered Human Gate", options: Array.isArray(gateEvent.data?.options) ? gateEvent.data.options.map(String) : ["allow", "reject"], evidenceIds: gateEvent.evidenceIds ?? [], status: "pending" };
+        if (kind === "task" && gateEvent.taskNumber !== undefined) core.pendingGateTaskNumber = gateEvent.taskNumber;
       }
       return core;
     }
@@ -111,16 +112,23 @@ export class ControllerCore {
     const resolvedGate = lastEvent(runEvents, (event) => event.type === "HUMAN_GATE_RESOLVED");
     if (gateEvent && (!resolvedGate || resolvedGate.at < gateEvent.at)) {
       const gateId = String(gateEvent.data?.gateId ?? `${started.runId}:recovered-gate`);
-      core.recoveredGate = { id: gateId, reason: gateEvent.reason ?? "recovered Human Gate", options: Array.isArray(gateEvent.data?.options) ? gateEvent.data.options.map(String) : ["allow", "reject"], evidenceIds: gateEvent.evidenceIds ?? [], status: "pending" };
-      if (gateEvent.taskNumber !== undefined) core.pendingGateTaskNumber = gateEvent.taskNumber;
+      const kind = gateEvent.data?.kind === "merge" ? "merge" : "task";
+      core.recoveredGate = { id: gateId, kind, reason: gateEvent.reason ?? "recovered Human Gate", options: Array.isArray(gateEvent.data?.options) ? gateEvent.data.options.map(String) : ["allow", "reject"], evidenceIds: gateEvent.evidenceIds ?? [], status: "pending" };
+      if (kind === "task" && gateEvent.taskNumber !== undefined) core.pendingGateTaskNumber = gateEvent.taskNumber;
     }
     const mergedEvent = lastEvent(runEvents, (event) => event.type === "TASK_MERGED" && event.taskNumber === taskNumber);
     const completedAfterMerge = completedEvent && mergedEvent && completedEvent.at >= mergedEvent.at;
+    const claimedTask = activeClaim?.data?.task && typeof activeClaim.data.task === "object" ? activeClaim.data.task as Task : undefined;
+    const verification = lastEvent(runEvents, (event) => event.type === "VERIFICATION_FINISHED" && event.taskNumber === taskNumber);
+    const evidence = Array.isArray(verification?.data?.evidence) ? verification.data.evidence as Evidence[] : [];
+    const gateKind = gateEvent?.data?.kind;
     if (mergedEvent && !completedAfterMerge) {
-      const verification = lastEvent(runEvents, (event) => event.type === "VERIFICATION_FINISHED" && event.taskNumber === taskNumber);
-      const evidence = Array.isArray(verification?.data?.evidence) ? verification.data.evidence as Evidence[] : [];
-      const claimedTask = activeClaim?.data?.task && typeof activeClaim.data.task === "object" ? activeClaim.data.task as Task : undefined;
       core.pendingFinalize = { taskNumber, task: claimedTask, workspace: { taskNumber, path: String(workspaceEvent.data.path), branch: String(workspaceEvent.data.branch), baseBranch: String(workspaceEvent.data.baseBranch) }, commit: typeof mergedEvent.data?.commit === "string" ? mergedEvent.data.commit : undefined, evidence };
+      core.recovery = undefined;
+    } else if (gateKind === "merge" && core.recoveredGate && claimedTask) {
+      const execution = lastEvent(runEvents, (event) => event.type === "EXECUTION_FINISHED" && event.taskNumber === taskNumber);
+      const worker = execution?.data?.result as WorkerResult | undefined;
+      core.pendingMerge = { task: claimedTask, workspace: { taskNumber, path: String(workspaceEvent.data.path), branch: String(workspaceEvent.data.branch), baseBranch: String(workspaceEvent.data.baseBranch) }, commit: worker?.commit, evidence };
       core.recovery = undefined;
     }
     return core;
@@ -215,6 +223,10 @@ export class ControllerCore {
             await this.stop("BLOCKED", `recovery Task #${recovered.taskNumber} is no longer available`);
             break;
           }
+          if (!await this.workspaceIsAvailable(recovered.workspace)) {
+            await this.stop("BLOCKED", `recovery Workspace for Task #${recovered.taskNumber} is stale or missing`);
+            break;
+          }
           await this.executeTask(task, activeSignal, recovered);
           this.currentTask = undefined;
           this.currentWorkspace = undefined;
@@ -231,6 +243,10 @@ export class ControllerCore {
           }
           this.pendingFinalize = undefined;
           this.currentWorkspace = pending.workspace;
+          if (!await this.workspaceIsAvailable(pending.workspace)) {
+            await this.stop("BLOCKED", `merged Workspace for Task #${pending.taskNumber} is stale or missing`);
+            break;
+          }
           await this.finalizeMergedTask(task, pending.workspace, pending.commit, pending.evidence);
           this.currentTask = undefined;
           this.currentWorkspace = undefined;
@@ -243,6 +259,10 @@ export class ControllerCore {
           this.gateDecision = undefined;
           this.runValue.gate = undefined;
           this.runValue.stopReason = undefined;
+          if (!await this.workspaceIsAvailable(pending.workspace)) {
+            await this.stop("BLOCKED", `merge Workspace for Task #${pending.task.number} is stale or missing`);
+            break;
+          }
           await this.completeMergedTask(pending.task, pending.workspace, pending.commit, pending.evidence);
           this.currentTask = undefined;
           this.currentWorkspace = undefined;
@@ -386,7 +406,7 @@ export class ControllerCore {
 
       if (!this.policy.autoMerge || this.policy.requireHumanForMerge || this.policy.protectedBranches.includes(this.policy.baseBranch)) {
         this.pendingMerge = { task, workspace: this.currentWorkspace, commit, evidence };
-        await this.createHumanGate(task, "merge requires human approval", ["allow", "reject"], "allow");
+        await this.createHumanGate(task, "merge requires human approval", ["allow", "reject"], "allow", "merge");
         return;
       }
 
@@ -440,9 +460,10 @@ export class ControllerCore {
     return result;
   }
 
-  private async createHumanGate(task: Task, reason: string, options: string[], recommendation?: string): Promise<void> {
+  private async createHumanGate(task: Task, reason: string, options: string[], recommendation?: string, kind: HumanGate["kind"] = "task"): Promise<void> {
     const gate: HumanGate = {
       id: `${this.runId}:gate:${task.number}:${this.now()}`,
+      kind,
       reason,
       options,
       ...(recommendation ? { recommendation } : {}),
@@ -454,7 +475,7 @@ export class ControllerCore {
     this.runValue.stopReason = "HUMAN_DECISION_REQUIRED";
     this.runValue.phase = "AWAITING_HUMAN";
     this.state = "stopped";
-    await this.append("HUMAN_GATE_CREATED", task.number, reason, gate.evidenceIds, { gateId: gate.id, options });
+    await this.append("HUMAN_GATE_CREATED", task.number, reason, gate.evidenceIds, { gateId: gate.id, options, kind });
   }
 
   private async blockTask(task: Task, reason: string): Promise<void> {
@@ -490,6 +511,10 @@ export class ControllerCore {
     };
     this.eventBuffer.push(event);
     await this.adapters.journal.append(event);
+  }
+
+  private async workspaceIsAvailable(workspace: Workspace): Promise<boolean> {
+    return this.adapters.workspaces.validate ? this.adapters.workspaces.validate(workspace) : true;
   }
 
   private async releaseLease(): Promise<void> {

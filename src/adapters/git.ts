@@ -20,6 +20,18 @@ export class GitWorkspaceManager implements WorkspaceManager {
     return { taskNumber: task.number, path, branch, baseBranch: policy.baseBranch };
   }
 
+  async validate(workspace: Workspace): Promise<boolean> {
+    const result = await this.commands.run("git", ["worktree", "list", "--porcelain"], { cwd: this.projectRoot, timeoutMs: 10_000 });
+    if (result.code !== 0) return false;
+    const lines = result.stdout.split(/\r?\n/);
+    for (let index = 0; index < lines.length; index += 1) {
+      if (lines[index] !== `worktree ${workspace.path}`) continue;
+      const branch = lines[index + 2];
+      return branch === `branch refs/heads/${workspace.branch}`;
+    }
+    return false;
+  }
+
   async commit(_task: Task, workspace: Workspace): Promise<string | undefined> {
     const result = await this.commands.run("git", ["log", "-1", "--format=%H"], { cwd: workspace.path, timeoutMs: 10_000 });
     return result.code === 0 ? result.stdout.trim() || undefined : undefined;

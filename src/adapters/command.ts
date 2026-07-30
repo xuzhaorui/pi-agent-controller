@@ -22,7 +22,7 @@ export class LocalCommandRunner implements CommandRunner {
       if (child.killed) return;
       killed = true;
       child.kill("SIGTERM");
-      setTimeout(() => { if (!child.killed) child.kill("SIGKILL"); }, 5_000).unref();
+      setTimeout(() => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); }, 5_000).unref();
     };
     if (options.timeoutMs !== undefined) timer = setTimeout(kill, options.timeoutMs);
     if (options.signal) {

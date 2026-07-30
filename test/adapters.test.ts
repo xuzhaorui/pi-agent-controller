@@ -67,6 +67,7 @@ test("creates a safe isolated Git Worktree from a clean repository", async () =>
     const workspace = await manager.create(task, policy);
     assert.equal(workspace.branch, "agent/task-7");
     assert.equal(await readFile(join(workspace.path, "README.md"), "utf8"), "base\n");
+    assert.equal(await manager.validate(workspace), true);
     await manager.cleanup(workspace, { ...policy, cleanupOnSuccess: true }, false);
   } finally {
     await rm(dir, { recursive: true, force: true });
