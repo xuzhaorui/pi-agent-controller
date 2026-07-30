@@ -1,0 +1,62 @@
+{
+  "schemaVersion": 1,
+  "readinessLabel": "ready-for-agent",
+  "inProgressLabel": "agent-doing",
+  "reviewLabel": "agent-review",
+  "blockedLabel": "agent-blocked",
+  "doneLabel": "agent-done",
+  "priorityLabels": {
+    "priority:p0": 0,
+    "priority:p1": 1,
+    "priority:p2": 2,
+    "priority:p3": 3
+  },
+  "requireAcceptanceCriteria": true,
+  "baseBranch": "main",
+  "branchPrefix": "agent/task-",
+  "workspaceRoot": "../agent-workspaces",
+  "autoMerge": true,
+  "closeIssueOnDone": false,
+  "requireHumanForMerge": false,
+  "maxTasks": 5,
+  "maxAttemptsPerTask": 2,
+  "maxRunDurationMs": 3600000,
+  "pollIntervalMs": 5000,
+  "verification": [
+    {
+      "name": "typecheck",
+      "command": "npm",
+      "args": ["run", "typecheck"],
+      "timeoutMs": 600000,
+      "required": true
+    },
+    {
+      "name": "test",
+      "command": "npm",
+      "args": ["test"],
+      "timeoutMs": 1200000,
+      "required": true
+    }
+  ],
+  "roles": {
+    "worker": {
+      "model": "YOUR_WORKER_MODEL",
+      "tools": ["read", "bash", "edit", "write"],
+      "timeoutMs": 1800000
+    },
+    "reviewer": {
+      "model": "YOUR_REVIEWER_MODEL",
+      "tools": ["read", "bash", "grep", "find", "ls"],
+      "timeoutMs": 900000
+    },
+    "architect": {
+      "model": "YOUR_ARCHITECT_MODEL",
+      "tools": ["read", "grep", "find", "ls"],
+      "timeoutMs": 900000
+    }
+  },
+  "protectedBranches": ["main", "master"],
+  "guardedPathPatterns": [".env", "production", "schema", "migration"],
+  "cleanupOnSuccess": true,
+  "cleanupOnFailure": false
+}

@@ -1,0 +1,30 @@
+{
+  "name": "pi-agent-controller",
+  "version": "0.1.0",
+  "description": "Deterministic orchestration loop for advancing GitHub tasks with Pi agents",
+  "type": "module",
+  "keywords": ["pi-package", "pi", "agent", "orchestration", "github"],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsc",
+    "test": "npm run build && node --test dist/test/*.test.js",
+    "check": "npm run typecheck && npm test"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  },
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  }
+}
