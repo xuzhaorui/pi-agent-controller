@@ -300,9 +300,9 @@ export class ControllerCore {
   }
 
   async pause(): Promise<void> {
+    // Do not change state or abort the current action here. The Reconcile Loop
+    // observes this flag after the current Worker/Verification/Review checkpoint.
     this.pauseRequested = true;
-    if (this.state === "new") return;
-    if (this.state === "active") await this.stop("PAUSED_BY_USER", "pause requested", true);
   }
 
   async stopNow(): Promise<void> {

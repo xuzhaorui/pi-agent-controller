@@ -49,8 +49,11 @@ export class GitHubIssueTracker implements TaskTracker {
   }
 
   async complete(task: Task, runId: string, label: string, comment: string, marker: string): Promise<void> {
-    await this.updateLabels(task.number, [label], [this.policy.readinessLabel, this.policy.inProgressLabel, this.policy.reviewLabel, this.policy.blockedLabel]);
+    // Publish the durable completion evidence before mutating labels or closing
+    // the Issue. A failed comment lookup/post therefore cannot leave a silent
+    // done-labelled Issue.
     await this.commentOnce(task.number, marker, `${comment}\n\nMarker: ${marker}`);
+    await this.updateLabels(task.number, [label], [this.policy.readinessLabel, this.policy.inProgressLabel, this.policy.reviewLabel, this.policy.blockedLabel]);
     if (this.policy.closeIssueOnDone) {
       const result = await this.commands.run("gh", ["issue", "close", String(task.number), "--repo", this.repo], { timeoutMs: 30_000 });
       if (result.code !== 0 && !/already closed/i.test(result.stderr)) throw new Error(`failed to close GitHub Issue #${task.number}: ${result.stderr.trim()}`);
