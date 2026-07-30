@@ -60,7 +60,6 @@ export class ControllerCore {
   private recovery?: RecoveryState;
   private recoveredGate?: HumanGate;
   private recoveredFromJournal = false;
-  private retryFindings?: string[];
   private pendingGateTask?: Task;
   private pendingGateTaskNumber?: number;
   private pendingFinalize?: { taskNumber: number; task?: Task; workspace: Workspace; commit?: string; evidence: Evidence[] };
@@ -429,8 +428,7 @@ export class ControllerCore {
     }
 
     let checkpoint = recovery;
-    let reviewFindings = this.retryFindings ?? recovery?.reviewFindings;
-    this.retryFindings = undefined;
+    let reviewFindings = recovery?.reviewFindings;
     for (this.currentTaskAttempts += 1; this.currentTaskAttempts <= this.policy.maxAttemptsPerTask; this.currentTaskAttempts += 1) {
       const checkpointState = checkpoint;
       const restoredWorker = checkpointState && checkpointState.phase !== "worker" && checkpointState.worker ? checkpointState.worker : undefined;
@@ -535,9 +533,8 @@ export class ControllerCore {
       }
       if (review.disposition === "changes_requested") {
         reviewFindings = review.findings.map((finding) => sanitizeText(finding, this.policy.secrets ?? []));
-        this.retryFindings = reviewFindings;
         if (this.pauseRequested) {
-          this.recovery = { taskNumber: task.number, task, workspace: this.currentWorkspace, attempts: this.currentTaskAttempts, phase: "worker", reviewFindings: this.retryFindings };
+          this.recovery = { taskNumber: task.number, task, workspace: this.currentWorkspace, attempts: this.currentTaskAttempts, phase: "worker", reviewFindings };
           await this.stop("PAUSED_BY_USER", "pause requested after review feedback", true);
           return;
         }
@@ -590,7 +587,12 @@ export class ControllerCore {
     await this.adapters.tasks.complete(task, this.runId, this.policy.doneLabel, comment, `${this.runId}:task:${task.number}:done`);
     await this.append("TASK_COMPLETED", task.number, "task completed", evidence.map((item) => item.id), { commit });
     this.runValue.usage.completedTasks += 1;
-    await this.adapters.workspaces.cleanup(workspace, this.policy, true);
+    try {
+      await this.adapters.workspaces.cleanup(workspace, this.policy, true);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      await this.append("TASK_CLEANUP_FAILED", task.number, reason, undefined, { workspace: workspace.path });
+    }
   }
 
   private async executeAgent(role: "worker" | "reviewer", task: Task, workspace: Workspace, signal: AbortSignal, evidence: Evidence[] = [], reviewFindings?: string[]): Promise<WorkerResult | ReviewResult> {
@@ -639,7 +641,10 @@ export class ControllerCore {
     this.currentTask = { ...task, state: "BLOCKED" };
     await this.adapters.tasks.block(task, this.runId, this.policy.blockedLabel, reason, `${this.runId}:task:${task.number}:blocked`);
     await this.append("TASK_BLOCKED", task.number, reason);
-    if (this.currentWorkspace) await this.adapters.workspaces.cleanup(this.currentWorkspace, this.policy, false);
+    if (this.currentWorkspace) {
+      try { await this.adapters.workspaces.cleanup(this.currentWorkspace, this.policy, false); }
+      catch (error) { await this.append("TASK_CLEANUP_FAILED", task.number, error instanceof Error ? error.message : String(error), undefined, { workspace: this.currentWorkspace.path }); }
+    }
     await this.stop("BLOCKED", reason);
   }
 

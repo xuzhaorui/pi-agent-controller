@@ -15,8 +15,10 @@ export class PiProcessAgentRuntime implements AgentRuntime {
   async execute(role: AgentRole, handoff: Handoff, signal: AbortSignal, onUpdate?: (text: string) => void): Promise<WorkerResult | ReviewResult> {
     const temp = await mkdtemp(join(tmpdir(), "pi-agent-controller-"));
     const systemPromptPath = join(temp, "system.md");
+    const handoffPath = join(temp, "handoff.json");
     await writeFile(systemPromptPath, systemPrompt(role), { encoding: "utf8", mode: 0o600 });
-    const args = ["--mode", "json", "-p", "--no-session", "--model", handoff.model, "--tools", handoff.tools.join(","), "--append-system-prompt", systemPromptPath, JSON.stringify(handoff)];
+    await writeFile(handoffPath, JSON.stringify(handoff), { encoding: "utf8", mode: 0o600 });
+    const args = ["--mode", "json", "-p", "--no-session", "--model", handoff.model, "--tools", handoff.tools.join(","), "--append-system-prompt", systemPromptPath, `Read and execute the Controller handoff from ${handoffPath}.`];
     const command = this.options.command ?? "pi";
     const child = spawn(command, args, { cwd: handoff.workspace.path, shell: false, env: { ...process.env, ...this.options.environment }, stdio: ["ignore", "pipe", "pipe"] });
     let buffer = "";

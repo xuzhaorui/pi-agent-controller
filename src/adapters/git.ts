@@ -82,8 +82,12 @@ export class GitWorkspaceManager implements WorkspaceManager {
 
   async cleanup(workspace: Workspace, policy: ControllerPolicy, success: boolean): Promise<void> {
     if ((success && !policy.cleanupOnSuccess) || (!success && !policy.cleanupOnFailure)) return;
-    await this.commands.run("git", ["worktree", "remove", workspace.path], { cwd: this.projectRoot, timeoutMs: 30_000 });
-    if (success) await this.commands.run("git", ["branch", "-d", workspace.branch], { cwd: this.projectRoot, timeoutMs: 10_000 });
+    const removed = await this.commands.run("git", ["worktree", "remove", workspace.path], { cwd: this.projectRoot, timeoutMs: 30_000 });
+    if (removed.code !== 0) throw new Error(`failed to remove Workspace: ${removed.stderr.trim()}`);
+    if (success) {
+      const deleted = await this.commands.run("git", ["branch", "-d", workspace.branch], { cwd: this.projectRoot, timeoutMs: 10_000 });
+      if (deleted.code !== 0) throw new Error(`failed to remove Workspace branch: ${deleted.stderr.trim()}`);
+    }
   }
 }
 

@@ -207,6 +207,7 @@ export type JournalEventType =
   | "TASK_COMPLETED"
   | "TASK_FAILED"
   | "TASK_BLOCKED"
+  | "TASK_CLEANUP_FAILED"
   | "TASK_PAUSED"
   | "LEASE_ACQUIRED"
   | "LEASE_RELEASED";
