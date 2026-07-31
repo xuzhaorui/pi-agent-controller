@@ -11,17 +11,29 @@
 
 ## Install
 
-From the repository checkout:
+Install from Git into the project you want to automate (run inside that project's checkout):
 
 ```bash
 pi install git:github.com/xuzhaorui/pi-agent-controller
 ```
 
-For development, install the local package from the repository root:
+Pi writes the package reference to `.pi/settings.json` and loads it on startup once the project is **trusted**. The first `pi` launch in a new project prompts for trust; approve it so the package auto-loads on every subsequent launch.
+
+For development, install the local checkout instead:
 
 ```bash
 pi install .
 ```
+
+### Verify the extension loads
+
+To try the package without trusting the project, load it ephemerally and confirm the `controller_status` tool answers:
+
+```bash
+pi -e . --tools controller_status -p "Call the controller_status tool."
+```
+
+A working install replies `Controller: idle (no Run)`. Slash commands (`/controller-start`, `/controller-status`, …) are available once the package is loaded in an interactive `pi` session.
 
 ## Configure
 
