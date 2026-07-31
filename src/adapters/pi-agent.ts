@@ -58,9 +58,7 @@ export class PiProcessAgentRuntime implements AgentRuntime {
       if (buffer.trim()) parseLine(buffer);
       if (killed || signal.aborted) throw new Error("Agent process was cancelled");
       if (code !== 0) throw new Error(`Agent process failed (${code}): ${stderr.trim() || finalText.slice(-500)}`);
-      const parsed = parseResult(finalText);
-      if (parsed && !parsed.usage.totalTokens) parsed.usage = usage;
-      return parsed;
+      return parseResult(finalText, usage);
     } finally {
       await rm(temp, { recursive: true, force: true });
     }
@@ -81,11 +79,14 @@ function systemPrompt(role: AgentRole): string {
   ].join("\n");
 }
 
-function parseResult(text: string): WorkerResult | ReviewResult {
+function parseResult(text: string, usage: Usage): WorkerResult | ReviewResult {
   if (!text.trim()) throw new Error("Agent did not return a JSON Result");
   let value: any;
   try { value = JSON.parse(text.trim()); } catch { throw new Error("Agent returned malformed Result JSON"); }
-  if (value?.schemaVersion !== 1 || !isUsage(value.usage) || !isStringArray(value.artifacts)) throw new Error("Agent Result failed schema validation");
+  // usage is authoritative and comes from the Pi subprocess message stream
+  // (normalised below), never from the model's self-reported Result body.
+  value.usage = usage;
+  if (value?.schemaVersion !== 1 || !isStringArray(value.artifacts)) throw new Error("Agent Result failed schema validation");
   if ("outcome" in value && ["completed", "failed", "blocked", "needs_human"].includes(value.outcome) && isStringArray(value.changedFiles) && isStringArray(value.testsClaimed) && isStringArray(value.risks) && isStringArray(value.blockers) && ["verify", "retry", "blocked", "human"].includes(value.recommendedDisposition) && (value.commit === undefined || typeof value.commit === "string")) {
     return value as WorkerResult;
   }
@@ -97,18 +98,18 @@ function parseResult(text: string): WorkerResult | ReviewResult {
 
 function isStringArray(value: unknown): value is string[] { return Array.isArray(value) && value.every((item) => typeof item === "string"); }
 
-function isUsage(value: unknown): value is Usage {
-  if (!value || typeof value !== "object") return false;
-  const usage = value as Record<string, unknown>;
-  return ["input", "output", "cacheRead", "cacheWrite", "totalTokens", "cost", "turns"].every((key) => typeof usage[key] === "number" && Number.isFinite(usage[key]));
-}
-
-function emptyUsage(): Usage { return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: 0, turns: 0 }; }
+function emptyUsage(): Usage { return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, totalTokens: 0, cost: 0, turns: 0 }; }
 
 function addUsage(current: Usage, raw: any): Usage {
+  // Pi emits usage.cost as an object {input,output,cacheRead,cacheWrite,total};
+  // normalise to the scalar cost used inside the Controller.
+  const cost = typeof raw?.cost === "object" && raw.cost !== null
+    ? (typeof raw.cost.total === "number" ? raw.cost.total : (raw.cost.input ?? 0) + (raw.cost.output ?? 0) + (raw.cost.cacheRead ?? 0) + (raw.cost.cacheWrite ?? 0))
+    : (typeof raw?.cost === "number" ? raw.cost : 0);
   return {
     input: current.input + (raw.input ?? 0), output: current.output + (raw.output ?? 0),
     cacheRead: current.cacheRead + (raw.cacheRead ?? 0), cacheWrite: current.cacheWrite + (raw.cacheWrite ?? 0),
-    totalTokens: current.totalTokens + (raw.totalTokens ?? 0), cost: current.cost + (raw.cost?.total ?? raw.cost ?? 0), turns: current.turns + 1,
+    reasoning: current.reasoning + (raw.reasoning ?? 0),
+    totalTokens: current.totalTokens + (raw.totalTokens ?? 0), cost: current.cost + cost, turns: current.turns + 1,
   };
 }

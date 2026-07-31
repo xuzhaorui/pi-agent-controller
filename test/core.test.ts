@@ -108,13 +108,13 @@ class FakeAgents implements AgentRuntime {
       return {
         schemaVersion: 1, outcome: "completed", changedFiles: ["src/change.ts"], commit: "worker-commit",
         testsClaimed: ["tests"], risks: [], blockers: [], recommendedDisposition: "verify",
-        usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15, cost: 0.01, turns: 1 }, artifacts: [],
+        usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, reasoning: 0, totalTokens: 15, cost: 0.01, turns: 1 }, artifacts: [],
       };
     }
     this.reviewers += 1;
     return {
       schemaVersion: 1, disposition: "approved", findings: [], risks: [],
-      usage: { input: 8, output: 3, cacheRead: 0, cacheWrite: 0, totalTokens: 11, cost: 0.01, turns: 1 }, artifacts: [],
+      usage: { input: 8, output: 3, cacheRead: 0, cacheWrite: 0, reasoning: 0, totalTokens: 11, cost: 0.01, turns: 1 }, artifacts: [],
     };
   }
 }
@@ -216,7 +216,7 @@ test("resumes from Verification Evidence without rerunning completed Worker work
   const setup = adapters([task(1, 1)]);
   const worker: WorkerResult = {
     schemaVersion: 1, outcome: "completed", changedFiles: ["src/change.ts"], commit: "worker-commit", testsClaimed: [], risks: [], blockers: [], recommendedDisposition: "verify",
-    usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: 0, turns: 1 }, artifacts: [],
+    usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, reasoning: 0, totalTokens: 2, cost: 0, turns: 1 }, artifacts: [],
   };
   const evidence: Evidence = { id: "verification-1", kind: "verification", name: "tests", success: true, output: "ok", metadata: {} };
   setup.journal.events.push(
@@ -278,10 +278,10 @@ test("recovers a pending merge Human Gate without rerunning the Worker", async (
   customPolicy.autoMerge = false;
   const worker: WorkerResult = {
     schemaVersion: 1, outcome: "completed", changedFiles: ["src/change.ts"], commit: "worker-commit", testsClaimed: [], risks: [], blockers: [], recommendedDisposition: "verify",
-    usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: 0, turns: 1 }, artifacts: [],
+    usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, reasoning: 0, totalTokens: 2, cost: 0, turns: 1 }, artifacts: [],
   };
   const evidence: Evidence = { id: "verification-1", kind: "verification", name: "tests", success: true, output: "ok", metadata: {} };
-  const review: ReviewResult = { schemaVersion: 1, disposition: "approved", findings: [], risks: [], usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: 0, turns: 1 }, artifacts: [] };
+  const review: ReviewResult = { schemaVersion: 1, disposition: "approved", findings: [], risks: [], usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, reasoning: 0, totalTokens: 2, cost: 0, turns: 1 }, artifacts: [] };
   setup.journal.events.push(
     { schemaVersion: 1, id: "run-3:1", at: 100, type: "RUN_STARTED", runId: "run-3" },
     { schemaVersion: 1, id: "run-3:2", at: 101, type: "TASK_CLAIMED", runId: "run-3", taskNumber: 1, data: { task: task(1, 1) } },

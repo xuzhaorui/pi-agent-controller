@@ -19,19 +19,18 @@ export class GitHubIssueTracker implements TaskTracker {
   ) {}
 
   async listOpenTasks(): Promise<Task[]> {
-    const result = await this.commands.run("gh", ["api", "--paginate", `repos/${this.repo}/issues?state=open&per_page=100`, "--jq", ".[] | @json"], { timeoutMs: 30_000 });
+    // `gh issue list --json` returns a single, newline-correctly-escaped JSON
+    // array and excludes pull requests. The earlier `gh api ... --jq '.[] | @json'`
+    // form left literal newlines inside issue bodies, which broke line-based parsing.
+    const result = await this.commands.run("gh", ["issue", "list", "--repo", this.repo, "--state", "open", "--json", "number,title,body,labels,url", "--limit", "1000"], { timeoutMs: 30_000 });
     if (result.code !== 0) throw new Error(`GitHub issue discovery failed: ${result.stderr.trim() || result.stdout.trim()}`);
-    const issues: GitHubIssueJson[] = [];
-    try {
-      for (const line of result.stdout.split(/\r?\n/).filter(Boolean)) {
-        const encoded = JSON.parse(line) as string;
-        const issue = JSON.parse(encoded) as GitHubIssueJson & { pull_request?: unknown; html_url?: string };
-        if (!issue.pull_request) issues.push({ ...issue, url: issue.url ?? issue.html_url ?? "" });
-      }
-    } catch { throw new Error("GitHub issue discovery returned malformed JSON"); }
+    let issues: GitHubIssueJson[];
+    try { issues = JSON.parse(result.stdout); }
+    catch { throw new Error("GitHub issue discovery returned malformed JSON"); }
+    if (!Array.isArray(issues)) throw new Error("GitHub issue discovery returned malformed JSON");
     return issues.map((issue) => {
       const labels = issue.labels.map((label) => label.name);
-      const task = taskFromIssue({ number: issue.number, title: issue.title, body: issue.body ?? "", url: issue.url, labels }, this.policy);
+      const task = taskFromIssue({ number: issue.number, title: issue.title, body: issue.body ?? "", url: issue.url ?? "", labels }, this.policy);
       if (labels.includes(this.policy.inProgressLabel)) task.state = "CLAIMED";
       if (labels.includes(this.policy.reviewLabel)) task.state = "REVIEWING";
       if (labels.includes(this.policy.blockedLabel)) task.state = "BLOCKED";

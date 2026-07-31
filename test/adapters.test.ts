@@ -6,9 +6,9 @@ import { tmpdir } from "node:os";
 import { FileJournal } from "../src/adapters/journal.js";
 import { FileRepositoryLease } from "../src/adapters/lease.js";
 import { GitWorkspaceManager } from "../src/adapters/git.js";
-import { parseGitHubRepo } from "../src/adapters/github.js";
+import { parseGitHubRepo, GitHubIssueTracker } from "../src/adapters/github.js";
 import { LocalVerificationRunner } from "../src/adapters/verification.js";
-import { type CommandRunner } from "../src/adapters/command.js";
+import { type CommandRunner, type CommandResult } from "../src/adapters/command.js";
 import { defaultPolicy, type Task } from "../src/domain.js";
 
 const run = async (command: string, args: string[], cwd: string): Promise<void> => {
@@ -98,4 +98,36 @@ test("keeps verification output bounded and stores the full artifact", async () 
     assert.ok(evidence[0]?.artifactPath);
     assert.equal((await readFile(evidence[0]!.artifactPath!, "utf8")).length, output.length);
   } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+class StubCommands implements CommandRunner {
+  constructor(private readonly stdout: string, private readonly code = 0, private readonly stderr = "") {}
+  async run(): Promise<CommandResult> { return { stdout: this.stdout, stderr: this.stderr, code: this.code, killed: false }; }
+}
+
+test("parses gh issue list --json output with multiline bodies and maps labels to Task state", async () => {
+  const gh = [
+    { number: 5, title: "Task", body: "intro\n\n## Acceptance Criteria\n- [ ] AC one\n- [ ] AC two", labels: [{ name: "ready-for-agent" }], url: "https://github.com/x/r/issues/5" },
+    { number: 7, title: "WIP", body: "", labels: [{ name: "agent-doing" }], url: "https://github.com/x/r/issues/7" },
+    { number: 9, title: "Review", body: "", labels: [{ name: "agent-review" }], url: "https://github.com/x/r/issues/9" },
+  ];
+  const policy = defaultPolicy();
+  const tracker = new GitHubIssueTracker("x/r", policy, new StubCommands(JSON.stringify(gh)));
+  const tasks = await tracker.listOpenTasks();
+  assert.equal(tasks.length, 3);
+  const ready = tasks[0]!;
+  const wip = tasks[1]!;
+  const review = tasks[2]!;
+  assert.equal(ready.number, 5);
+  assert.equal(ready.state, "READY");
+  assert.deepEqual(ready.acceptanceCriteria, ["AC one", "AC two"]);
+  assert.equal(wip.state, "CLAIMED");
+  assert.equal(review.state, "REVIEWING");
+});
+
+test("fails when gh issue discovery exits non-zero or returns malformed JSON", async () => {
+  const policy = defaultPolicy();
+  await assert.rejects(new GitHubIssueTracker("x/r", policy, new StubCommands("", 1, "not authenticated")).listOpenTasks(), /not authenticated/);
+  await assert.rejects(new GitHubIssueTracker("x/r", policy, new StubCommands("not an array")).listOpenTasks(), /malformed JSON/);
+  await assert.rejects(new GitHubIssueTracker("x/r", policy, new StubCommands("{}", 0)).listOpenTasks(), /malformed JSON/);
 });

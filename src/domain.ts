@@ -92,6 +92,7 @@ export interface ControllerPolicy {
 export interface RoleUsage {
   input: number;
   output: number;
+  reasoning: number;
   tokens: number;
   cost: number;
   turns: number;
@@ -147,6 +148,7 @@ export interface Usage {
   output: number;
   cacheRead: number;
   cacheWrite: number;
+  reasoning: number;
   totalTokens: number;
   cost: number;
   turns: number;

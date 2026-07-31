@@ -23,7 +23,7 @@ import {
   validatePolicy,
 } from "./domain.js";
 
-function emptyRoleUsage(): RoleUsage { return { input: 0, output: 0, tokens: 0, cost: 0, turns: 0 }; }
+function emptyRoleUsage(): RoleUsage { return { input: 0, output: 0, reasoning: 0, tokens: 0, cost: 0, turns: 0 }; }
 
 function createBudgetUsage(startedAt: number) {
   return { completedTasks: 0, attempts: 0, tokens: 0, cost: 0, roleUsage: { worker: emptyRoleUsage(), reviewer: emptyRoleUsage(), architect: emptyRoleUsage() }, startedAt };
@@ -714,12 +714,13 @@ export class ControllerCore {
     await this.append("LEASE_RELEASED", undefined, "lease released");
   }
 
-  private addUsage(role: AgentRole, usage: { input: number; output: number; cacheRead: number; cacheWrite: number; totalTokens: number; cost: number; turns: number }): void {
+  private addUsage(role: AgentRole, usage: { input: number; output: number; cacheRead: number; cacheWrite: number; reasoning: number; totalTokens: number; cost: number; turns: number }): void {
     this.runValue.usage.tokens += usage.totalTokens;
     this.runValue.usage.cost += usage.cost;
     const roleUsage = this.runValue.usage.roleUsage[role];
     roleUsage.input += usage.input;
     roleUsage.output += usage.output;
+    roleUsage.reasoning += usage.reasoning;
     roleUsage.tokens += usage.totalTokens;
     roleUsage.cost += usage.cost;
     roleUsage.turns += usage.turns;
@@ -729,11 +730,11 @@ export class ControllerCore {
     this.runValue.usage.completedTasks = events.filter((event) => event.type === "TASK_COMPLETED").length;
     this.runValue.usage.attempts = events.filter((event) => event.type === "EXECUTION_STARTED").length;
     for (const event of events) {
-      const result = event.data?.result as { usage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; totalTokens?: number; cost?: number; turns?: number } } | undefined;
+      const result = event.data?.result as { usage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; reasoning?: number; totalTokens?: number; cost?: number; turns?: number } } | undefined;
       if (result?.usage && (event.type === "EXECUTION_FINISHED" || event.type === "REVIEW_FINISHED")) {
         this.addUsage(event.type === "EXECUTION_FINISHED" ? "worker" : "reviewer", {
           input: result.usage.input ?? 0, output: result.usage.output ?? 0, cacheRead: result.usage.cacheRead ?? 0,
-          cacheWrite: result.usage.cacheWrite ?? 0, totalTokens: result.usage.totalTokens ?? 0, cost: result.usage.cost ?? 0, turns: result.usage.turns ?? 0,
+          cacheWrite: result.usage.cacheWrite ?? 0, reasoning: result.usage.reasoning ?? 0, totalTokens: result.usage.totalTokens ?? 0, cost: result.usage.cost ?? 0, turns: result.usage.turns ?? 0,
         });
       }
     }
@@ -813,7 +814,7 @@ function isStringArray(value: unknown): value is string[] {
 function isUsage(value: unknown): value is WorkerResult["usage"] {
   if (!value || typeof value !== "object") return false;
   const usage = value as Record<string, unknown>;
-  return ["input", "output", "cacheRead", "cacheWrite", "totalTokens", "cost", "turns"].every((key) => typeof usage[key] === "number" && Number.isFinite(usage[key]));
+  return ["input", "output", "cacheRead", "cacheWrite", "reasoning", "totalTokens", "cost", "turns"].every((key) => typeof usage[key] === "number" && Number.isFinite(usage[key]));
 }
 
 function isWorkerResult(result: WorkerResult | ReviewResult): result is WorkerResult {
