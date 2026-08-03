@@ -86,8 +86,16 @@ export class ControllerService {
     const projectRoot = rootResult.stdout.trim();
     const policy = await loadPolicy(projectRoot);
     const remoteResult = await commands.run("git", ["remote", "-v"], { cwd: projectRoot, timeoutMs: 10_000 });
-    const remote = remoteResult.stdout.split(/\r?\n/).map((line) => line.trim().split(/\s+/)[1]).find((value): value is string => Boolean(value && parseGitHubRepo(value)));
-    const repo = remote ? parseGitHubRepo(remote) : undefined;
+    const remotes = new Map<string, string>();
+    for (const line of remoteResult.stdout.split(/\r?\n/)) {
+      const parts = line.trim().split(/\s+/);
+      if (parts.length >= 2 && !remotes.has(parts[0]!)) {
+        const repo = parseGitHubRepo(parts[1]!);
+        if (repo) remotes.set(parts[0]!, repo);
+      }
+    }
+    // Prefer the canonical `origin` remote; fall back to the first GitHub remote in listing order.
+    const repo = remotes.get("origin") ?? remotes.values().next().value;
     if (!repo) throw new Error("current repository does not have a GitHub remote");
     const gitPathResult = await commands.run("git", ["rev-parse", "--git-path", "agent-controller"], { cwd: projectRoot, timeoutMs: 10_000 });
     if (gitPathResult.code !== 0) throw new Error("cannot resolve Git metadata directory");
