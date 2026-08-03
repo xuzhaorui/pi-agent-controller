@@ -75,6 +75,40 @@ test("creates a safe isolated Git Worktree from a clean repository", async () =>
   }
 });
 
+test("in-place mode runs directly in the current checkout without a Worktree", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "controller-git-inplace-"));
+  try {
+    await run("git", ["init", "-b", "main"], dir);
+    await run("git", ["config", "user.email", "test@example.com"], dir);
+    await run("git", ["config", "user.name", "Test"], dir);
+    await writeFile(join(dir, "README.md"), "base\n");
+    await run("git", ["add", "."], dir);
+    await run("git", ["commit", "-m", "base"], dir);
+    // Uncommitted changes must not block in-place mode (dirty checkk is skipped).
+    await writeFile(join(dir, "README.md"), "base\nchanged\n");
+    const policy = defaultPolicy();
+    policy.workspaceMode = "current";
+    const task: Task = { number: 7, title: "task", body: "", labels: [policy.readinessLabel], priority: 1, state: "READY", acceptanceCriteria: [], dependencies: [] };
+    const manager = new GitWorkspaceManager(dir);
+    const workspace = await manager.create(task, policy);
+    assert.equal(workspace.path, dir);
+    assert.equal(workspace.inPlace, true);
+    assert.equal(workspace.branch, "main");
+    assert.equal(await manager.validate(workspace), true);
+    assert.equal(await manager.find(task, policy), undefined);
+    assert.equal(await manager.commit(task, workspace), undefined);
+    assert.equal(await manager.diff(workspace), "");
+    assert.deepEqual(await manager.merge(workspace, policy), { commit: undefined });
+    await manager.cleanup(workspace, { ...policy, cleanupOnSuccess: true }, true);
+    const { exec } = await import("node:child_process");
+    const worktrees = await new Promise<string>((resolve, reject) => {
+      exec("git worktree list --porcelain", { cwd: dir }, (error, stdout) => error ? reject(error) : resolve(stdout));
+    });
+    const worktreeLines = worktrees.trim().split(/\r?\n/).filter((line) => line.startsWith("worktree "));
+    assert.deepEqual(worktreeLines, [`worktree ${dir}`]); // only the main checkout is listed
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
 test("redacts generic credential patterns before persisting verification output", async () => {
   const dir = await mkdtemp(join(tmpdir(), "controller-redact-"));
   try {

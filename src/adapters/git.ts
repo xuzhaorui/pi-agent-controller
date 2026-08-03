@@ -7,6 +7,11 @@ export class GitWorkspaceManager implements WorkspaceManager {
   constructor(private readonly projectRoot: string, private readonly commands: CommandRunner = new LocalCommandRunner()) {}
 
   async create(task: Task, policy: ControllerPolicy): Promise<Workspace> {
+    if (policy.workspaceMode === "current") {
+      const branchResult = await this.commands.run("git", ["rev-parse", "--abbrev-ref", "HEAD"], { cwd: this.projectRoot, timeoutMs: 10_000 });
+      const branch = branchResult.code === 0 ? branchResult.stdout.trim() : "HEAD";
+      return { taskNumber: task.number, path: this.projectRoot, branch, baseBranch: policy.baseBranch, inPlace: true };
+    }
     const status = await this.commands.run("git", ["status", "--porcelain"], { cwd: this.projectRoot, timeoutMs: 10_000 });
     if (status.code !== 0) throw new Error(`cannot inspect repository: ${status.stderr.trim()}`);
     if (status.stdout.trim()) throw new Error("repository has uncommitted changes; refusing to create a Workspace");
@@ -21,6 +26,7 @@ export class GitWorkspaceManager implements WorkspaceManager {
   }
 
   async find(task: Task, policy: ControllerPolicy): Promise<Workspace | undefined> {
+    if (policy.workspaceMode === "current") return undefined;
     const branch = branchName(task, policy);
     const result = await this.commands.run("git", ["worktree", "list", "--porcelain"], { cwd: this.projectRoot, timeoutMs: 10_000 });
     if (result.code !== 0) return undefined;
@@ -39,6 +45,7 @@ export class GitWorkspaceManager implements WorkspaceManager {
   }
 
   async validate(workspace: Workspace): Promise<boolean> {
+    if (workspace.inPlace) return true;
     const result = await this.commands.run("git", ["worktree", "list", "--porcelain"], { cwd: this.projectRoot, timeoutMs: 10_000 });
     if (result.code !== 0) return false;
     const lines = result.stdout.split(/\r?\n/);
@@ -54,6 +61,7 @@ export class GitWorkspaceManager implements WorkspaceManager {
   }
 
   async commit(_task: Task, workspace: Workspace): Promise<string | undefined> {
+    if (workspace.inPlace) return undefined; // in-place mode: changes stay in the current checkout, no commit is enforced
     const status = await this.commands.run("git", ["status", "--porcelain"], { cwd: workspace.path, timeoutMs: 10_000 });
     if (status.code !== 0) throw new Error(`cannot inspect Worker Workspace: ${status.stderr.trim()}`);
     if (status.stdout.trim()) throw new Error("Worker left uncommitted changes in the Workspace");
@@ -65,12 +73,14 @@ export class GitWorkspaceManager implements WorkspaceManager {
   }
 
   async diff(workspace: Workspace): Promise<string> {
+    if (workspace.inPlace) return "";
     const result = await this.commands.run("git", ["diff", `${workspace.baseBranch}...HEAD`], { cwd: workspace.path, timeoutMs: 30_000 });
     if (result.code !== 0) throw new Error(`failed to read Workspace diff: ${result.stderr.trim()}`);
     return result.stdout;
   }
 
   async merge(workspace: Workspace, _policy: ControllerPolicy): Promise<{ commit?: string }> {
+    if (workspace.inPlace) return { commit: undefined }; // in-place mode: nothing to merge
     const result = await this.commands.run("git", ["merge", "--no-ff", workspace.branch, "-m", `Merge ${workspace.branch}`], { cwd: this.projectRoot, timeoutMs: 60_000 });
     if (result.code !== 0) {
       await this.commands.run("git", ["merge", "--abort"], { cwd: this.projectRoot, timeoutMs: 10_000 });
@@ -81,6 +91,7 @@ export class GitWorkspaceManager implements WorkspaceManager {
   }
 
   async cleanup(workspace: Workspace, policy: ControllerPolicy, success: boolean): Promise<void> {
+    if (workspace.inPlace) return; // in-place mode: nothing to clean up
     if ((success && !policy.cleanupOnSuccess) || (!success && !policy.cleanupOnFailure)) return;
     const removed = await this.commands.run("git", ["worktree", "remove", workspace.path], { cwd: this.projectRoot, timeoutMs: 30_000 });
     if (removed.code !== 0) {

@@ -90,4 +90,5 @@ A run stops with an explicit reason such as `BACKLOG_EMPTY`, `HUMAN_DECISION_REQ
 - The Pi process Runtime declares `cancel` support. `/controller-interrupt` cancels only the active Execution; retry or blocking remains Policy-controlled. `/controller-stop` cancels it and terminates the Run.
 - Mid-Execution `pause` and `steer` are currently unsupported; graceful Run pause takes effect at a safe checkpoint.
 - Failed Workspaces are retained by default; inspect their evidence before cleanup.
+- With `workspaceMode: "current"`, the clean-checkout requirement is skipped and the Worker runs directly in the current checkout; changes are left in place, commits are not enforced, and no merge or Worktree cleanup happens.
 - Runtime Journal and lease data are stored under the repository's Git metadata, not committed to the project.

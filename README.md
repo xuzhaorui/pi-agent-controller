@@ -26,7 +26,7 @@ MVP implementation in progress. The deterministic Core, GitHub/Git/verification/
 
 - Deterministic reconciliation, not an LLM deciding whether to continue
 - GitHub Issues as task intent; Git as code truth; durable journal as execution truth
-- One active task in one isolated worktree
+- One active task in one isolated worktree (or directly in the current checkout with `workspaceMode: "current"`)
 - Worker and Reviewer as bounded Executions, not nested Subagents
 - Normalized lifecycle, tool, usage, and termination events in the durable journal
 - Explicit intervention capabilities: cancellation is supported; pause/steer are never implied
@@ -35,6 +35,13 @@ MVP implementation in progress. The deterministic Core, GitHub/Git/verification/
 - Human gates for architecture and dangerous operations
 - Bounded autonomy through budgets, retries, and explicit stop reasons
 - Installable as a Pi package
+
+## Workspace modes
+
+Policy controls how a Task Workspace is created via `workspaceMode`:
+
+- `worktree` (default): each Task gets its own Git Worktree on a dedicated branch, isolated from the main checkout.
+- `current`: the Worker runs directly in the current checkout — no Worktree is created, no commits are enforced, and no merge happens on completion. Use this when the checkout itself is the deliverable (for example, when the repository does not track the files the Task edits, such as a nested frontend checkout). Changes remain in the checkout for you to review and commit yourself.
 
 ## License
 

@@ -108,6 +108,7 @@ export interface ControllerPolicy {
   baseBranch: string;
   branchPrefix: string;
   workspaceRoot: string;
+  workspaceMode: "worktree" | "current";
   autoMerge: boolean;
   closeIssueOnDone: boolean;
   requireHumanForMerge: boolean;
@@ -163,6 +164,7 @@ export interface Workspace {
   path: string;
   branch: string;
   baseBranch: string;
+  inPlace?: boolean;
 }
 
 export interface Handoff {
@@ -354,6 +356,7 @@ export function defaultPolicy(): ControllerPolicy {
     baseBranch: "main",
     branchPrefix: "agent/task-",
     workspaceRoot: "../agent-workspaces",
+    workspaceMode: "worktree",
     autoMerge: false,
     closeIssueOnDone: true,
     requireHumanForMerge: false,
@@ -423,6 +426,7 @@ export function validatePolicy(policy: ControllerPolicy): string[] {
   if (policy.maxAttemptsPerTask < 1) errors.push("maxAttemptsPerTask must be at least 1");
   if (policy.maxRunDurationMs < 1) errors.push("maxRunDurationMs must be positive");
   if (policy.pollIntervalMs < 0) errors.push("pollIntervalMs cannot be negative");
+  if (policy.workspaceMode !== "worktree" && policy.workspaceMode !== "current") errors.push('workspaceMode must be "worktree" or "current"');
   for (const role of ["worker", "reviewer"] as const) {
     if (!policy.roles[role]) errors.push(`missing ${role} role policy`);
     else if (!policy.roles[role].model.trim()) errors.push(`${role} model is required`);

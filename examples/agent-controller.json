@@ -15,6 +15,7 @@
   "baseBranch": "main",
   "branchPrefix": "agent/task-",
   "workspaceRoot": "../agent-workspaces",
+  "workspaceMode": "worktree",
   "autoMerge": true,
   "closeIssueOnDone": false,
   "requireHumanForMerge": false,
