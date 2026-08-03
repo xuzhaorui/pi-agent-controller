@@ -1,9 +1,10 @@
 import {
-  type AgentRole,
-  type AgentRuntime,
   type ControllerAdapters,
   type ControllerPolicy,
   type Evidence,
+  type ExecutionEvent,
+  type ExecutionRole,
+  type ExecutionRuntime,
   type Handoff,
   type HumanGate,
   type JournalEvent,
@@ -51,6 +52,7 @@ export class ControllerCore {
   private readonly projectRoot: string;
   private readonly runId: string;
   private readonly abortController = new AbortController();
+  private activeExecutionAbort?: AbortController;
   private readonly eventBuffer: JournalEvent[] = [];
   private readonly evidence: Evidence[] = [];
   private state: ControllerState = "new";
@@ -197,6 +199,10 @@ export class ControllerCore {
 
   get snapshot(): Run {
     return clone(this.runValue);
+  }
+
+  get executionEvents(): JournalEvent[] {
+    return this.eventBuffer.filter((event) => event.type === "EXECUTION_PROGRESS").map((event) => clone(event));
   }
 
   get evidenceItems(): Evidence[] {
@@ -388,6 +394,12 @@ export class ControllerCore {
     if (!wasActive) await this.releaseLease();
   }
 
+  interruptExecution(): boolean {
+    if (!this.runValue.activeExecution || !this.activeExecutionAbort || this.activeExecutionAbort.signal.aborted) return false;
+    this.activeExecutionAbort.abort("interrupted by user");
+    return true;
+  }
+
   async approve(gateId: string, decision: string): Promise<boolean> {
     if (this.runValue.gate?.id !== gateId || this.runValue.gate.status !== "pending") return false;
     if (!this.runValue.gate.options.includes(decision)) return false;
@@ -451,12 +463,16 @@ export class ControllerCore {
       } else {
         this.runValue.usage.attempts += 1;
         this.runValue.phase = "RUNNING";
-        await this.append("EXECUTION_STARTED", task.number, "worker started", undefined, { attempt: this.currentTaskAttempts });
+        await this.append("EXECUTION_STARTED", task.number, "worker Execution started", undefined, {
+          attempt: this.currentTaskAttempts,
+          role: "worker",
+          executionId: `${this.runId}:task:${task.number}:worker:${this.currentTaskAttempts}`,
+        });
       }
       let worker: WorkerResult;
       const workerReviewFindings = reviewFindings ?? checkpointState?.reviewFindings;
       try {
-        worker = restoredWorker ?? await this.executeAgent("worker", task, this.currentWorkspace, signal, undefined, workerReviewFindings) as WorkerResult;
+        worker = restoredWorker ?? await this.executeRole("worker", task, this.currentWorkspace, signal, undefined, workerReviewFindings) as WorkerResult;
       } catch (error) {
         if (signal.aborted) throw error;
         const reason = error instanceof Error ? error.message : String(error);
@@ -527,7 +543,7 @@ export class ControllerCore {
           review = restoredReview;
         } else {
           await this.adapters.tasks.markReview(task, this.runId, this.policy.reviewLabel, `${this.runId}:task:${task.number}:review`);
-          review = await this.executeAgent("reviewer", task, this.currentWorkspace, signal, safeEvidence) as ReviewResult;
+          review = await this.executeRole("reviewer", task, this.currentWorkspace, signal, safeEvidence) as ReviewResult;
         }
       } catch (error) {
         if (signal.aborted) throw error;
@@ -609,11 +625,13 @@ export class ControllerCore {
     }
   }
 
-  private async executeAgent(role: "worker" | "reviewer", task: Task, workspace: Workspace, signal: AbortSignal, evidence: Evidence[] = [], reviewFindings?: string[]): Promise<WorkerResult | ReviewResult> {
+  private async executeRole(role: "worker" | "reviewer", task: Task, workspace: Workspace, signal: AbortSignal, evidence: Evidence[] = [], reviewFindings?: string[]): Promise<WorkerResult | ReviewResult> {
     const rolePolicy = this.policy.roles[role];
+    const executionId = `${this.runId}:task:${task.number}:${role}:${this.currentTaskAttempts}`;
     const diff = role === "reviewer" ? await this.adapters.workspaces.diff(workspace) : undefined;
     const handoff: Handoff = {
       schemaVersion: 1,
+      executionId,
       runId: this.runId,
       task,
       workspace,
@@ -627,10 +645,48 @@ export class ControllerCore {
       ...(diff !== undefined ? { diff: limitContext(diff) } : {}),
       ...(reviewFindings && reviewFindings.length > 0 ? { reviewFindings } : {}),
     };
-    const result = await this.adapters.agents.execute(role, handoff, signal);
-    if (role === "worker" && !isWorkerResult(result)) throw new Error("Agent returned an invalid WorkerResult");
-    if (role === "reviewer" && !isReviewResult(result)) throw new Error("Agent returned an invalid ReviewResult");
-    return result;
+    const startedAt = this.now();
+    const interventionController = new AbortController();
+    this.activeExecutionAbort = interventionController;
+    this.runValue.activeExecution = {
+      id: executionId,
+      role,
+      state: "STARTING",
+      startedAt,
+      updatedAt: startedAt,
+      capabilities: { ...this.adapters.executions.capabilities },
+    };
+    const timeoutSignal = AbortSignal.timeout(rolePolicy.timeoutMs);
+    const executionSignal = AbortSignal.any([signal, timeoutSignal, interventionController.signal]);
+    try {
+      const result = await this.adapters.executions.execute(
+        { id: executionId, role, handoff },
+        executionSignal,
+        async (event) => this.recordExecutionEvent(task.number, event),
+      );
+      if (role === "worker" && !isWorkerResult(result)) throw new Error("Execution returned an invalid WorkerResult");
+      if (role === "reviewer" && !isReviewResult(result)) throw new Error("Execution returned an invalid ReviewResult");
+      return result;
+    } catch (error) {
+      if (timeoutSignal.aborted && !signal.aborted) throw new Error(`${role} Execution timed out after ${rolePolicy.timeoutMs}ms`);
+      throw error;
+    } finally {
+      if (this.activeExecutionAbort === interventionController) this.activeExecutionAbort = undefined;
+      this.runValue.activeExecution = undefined;
+      this.runValue.updatedAt = this.now();
+    }
+  }
+
+  private async recordExecutionEvent(taskNumber: number, event: ExecutionEvent): Promise<void> {
+    const safeEvent = sanitizeExecutionEvent(event, this.policy.secrets ?? []);
+    const active = this.runValue.activeExecution;
+    if (active?.id === safeEvent.executionId) {
+      active.state = "RUNNING";
+      active.updatedAt = safeEvent.at;
+      active.lastEvent = { type: safeEvent.type, summary: safeEvent.summary, at: safeEvent.at };
+    }
+    this.runValue.updatedAt = this.now();
+    await this.append("EXECUTION_PROGRESS", taskNumber, safeEvent.summary, undefined, { event: safeEvent });
   }
 
   private async createHumanGate(task: Task, reason: string, options: string[], recommendation?: string, kind: HumanGate["kind"] = "task"): Promise<void> {
@@ -714,7 +770,7 @@ export class ControllerCore {
     await this.append("LEASE_RELEASED", undefined, "lease released");
   }
 
-  private addUsage(role: AgentRole, usage: { input: number; output: number; cacheRead: number; cacheWrite: number; reasoning: number; totalTokens: number; cost: number; turns: number }): void {
+  private addUsage(role: ExecutionRole, usage: { input: number; output: number; cacheRead: number; cacheWrite: number; reasoning: number; totalTokens: number; cost: number; turns: number }): void {
     this.runValue.usage.tokens += usage.totalTokens;
     this.runValue.usage.cost += usage.cost;
     const roleUsage = this.runValue.usage.roleUsage[role];
@@ -779,6 +835,34 @@ function sanitizeEvidence(evidence: Evidence, secrets: string[]): Evidence {
   };
 }
 
+function sanitizeExecutionEvent(event: ExecutionEvent, secrets: string[]): ExecutionEvent {
+  const summary = limitText(sanitizeText(event.summary, secrets), 4 * 1024);
+  const details = event.details
+    ? sanitizeValue(event.details, secrets) as Record<string, unknown>
+    : undefined;
+  return {
+    ...event,
+    summary,
+    ...(details ? { details: boundExecutionDetails(details) } : {}),
+  };
+}
+
+function boundExecutionDetails(details: Record<string, unknown>): Record<string, unknown> {
+  let serialized: string;
+  try { serialized = JSON.stringify(details); }
+  catch { return { preview: "[unserializable Execution details]", truncated: true }; }
+  if (Buffer.byteLength(serialized, "utf8") <= 8 * 1024) return details;
+  return { preview: limitText(serialized, 8 * 1024), truncated: true };
+}
+
+function limitText(value: string, maxBytes: number): string {
+  if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
+  let result = value;
+  const suffix = "\n[truncated]";
+  while (result.length > 0 && Buffer.byteLength(result + suffix, "utf8") > maxBytes) result = result.slice(0, -256);
+  return result + suffix;
+}
+
 function limitContext(value: string): string {
   const maxBytes = 50 * 1024;
   if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
@@ -829,4 +913,4 @@ function isReviewResult(result: WorkerResult | ReviewResult): result is ReviewRe
     && isStringArray(result.findings) && isStringArray(result.risks) && isStringArray(result.artifacts) && isUsage(result.usage);
 }
 
-export type { AgentRuntime };
+export type { ExecutionRuntime };

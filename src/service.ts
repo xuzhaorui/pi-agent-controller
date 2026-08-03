@@ -2,13 +2,13 @@ import { resolve } from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { ControllerCore } from "./core.js";
 import { loadPolicy } from "./config.js";
-import { defaultPolicy, selectNextTask, type ControllerPolicy, type ReconcileResult, type Run } from "./domain.js";
+import { defaultPolicy, selectNextTask, type ControllerPolicy, type JournalEvent, type JournalStore, type ReconcileResult, type Run } from "./domain.js";
 import { LocalCommandRunner } from "./adapters/command.js";
 import { GitHubIssueTracker, parseGitHubRepo } from "./adapters/github.js";
 import { GitWorkspaceManager } from "./adapters/git.js";
 import { FileJournal } from "./adapters/journal.js";
 import { FileRepositoryLease } from "./adapters/lease.js";
-import { PiProcessAgentRuntime } from "./adapters/pi-agent.js";
+import { PiProcessExecutionRuntime } from "./adapters/pi-execution.js";
 import { LocalVerificationRunner } from "./adapters/verification.js";
 
 export class ControllerService {
@@ -17,6 +17,7 @@ export class ControllerService {
   private lastResult?: ReconcileResult;
   private projectRoot?: string;
   private policy?: ControllerPolicy;
+  private journal?: JournalStore;
 
   async start(ctx: ExtensionContext, dryRun = false): Promise<Run | ReconcileResult | undefined> {
     if (this.running) return this.core?.snapshot;
@@ -39,12 +40,23 @@ export class ControllerService {
 
   async stop(): Promise<void> { await this.core?.stopNow(); }
 
+  interruptExecution(): boolean { return this.core?.interruptExecution() ?? false; }
+
   async approve(gateId: string, decision: string, ctx: ExtensionContext): Promise<Run | ReconcileResult | undefined> {
     if (!this.core || !await this.core.approve(gateId, decision)) return undefined;
     return this.resume(ctx);
   }
 
   status(): Run | undefined { return this.core?.snapshot ?? this.lastResult?.run; }
+
+  async executionEvents(limit = 10, ctx?: ExtensionContext): Promise<JournalEvent[]> {
+    const boundedLimit = Math.max(1, Math.min(20, Math.floor(limit)));
+    if (!this.journal && ctx) await this.setup(ctx);
+    const events = this.journal
+      ? await this.journal.read()
+      : this.core?.executionEvents ?? this.lastResult?.events ?? [];
+    return events.filter((event) => event.type === "EXECUTION_PROGRESS").slice(-boundedLimit);
+  }
 
   async shutdown(): Promise<void> {
     await this.core?.shutdown();
@@ -81,8 +93,10 @@ export class ControllerService {
     if (gitPathResult.code !== 0) throw new Error("cannot resolve Git metadata directory");
     const stateRoot = resolve(projectRoot, gitPathResult.stdout.trim());
     const tasks = new GitHubIssueTracker(repo, policy, commands, policy.secrets ?? []);
+    const journal = new FileJournal(resolve(stateRoot, "run-journal.jsonl"));
     this.projectRoot = projectRoot;
     this.policy = policy;
+    this.journal = journal;
     return {
       projectRoot,
       policy,
@@ -90,9 +104,9 @@ export class ControllerService {
       adapters: {
         tasks,
         workspaces: new GitWorkspaceManager(projectRoot, commands),
-        agents: new PiProcessAgentRuntime(),
+        executions: new PiProcessExecutionRuntime(),
         verification: new LocalVerificationRunner(undefined, commands, policy.secrets ?? []),
-        journal: new FileJournal(resolve(stateRoot, "run-journal.jsonl")),
+        journal,
         lease: new FileRepositoryLease(resolve(stateRoot, "lease.json")),
       },
     };
@@ -108,7 +122,15 @@ export function statusText(run: Run | undefined): string {
   if (!run) return "Controller: idle (no Run)";
   const task = run.currentTask === undefined ? "none" : `#${run.currentTask}`;
   const stop = run.stopReason ? ` stop=${run.stopReason}` : "";
-  return `Controller: ${run.state.toLowerCase()} phase=${run.phase} task=${task} completed=${run.usage.completedTasks} attempts=${run.usage.attempts}${stop}`;
+  const execution = run.activeExecution
+    ? ` execution=${run.activeExecution.id}(${run.activeExecution.role}:${run.activeExecution.state.toLowerCase()}) controls=${supportedControls(run.activeExecution.capabilities)}`
+    : "";
+  return `Controller: ${run.state.toLowerCase()} phase=${run.phase} task=${task}${execution} completed=${run.usage.completedTasks} attempts=${run.usage.attempts}${stop}`;
+}
+
+function supportedControls(capabilities: { cancel: boolean; pause: boolean; steer: boolean }): string {
+  const controls = Object.entries(capabilities).filter(([, supported]) => supported).map(([name]) => name);
+  return controls.join("|") || "none";
 }
 
 export function defaultConfigExample(): ControllerPolicy { return defaultPolicy(); }

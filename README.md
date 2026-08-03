@@ -5,7 +5,7 @@ A deterministic controller loop for continuously advancing GitHub Issues with Pi
 Pi Agent Controller is designed for a **Pi + WSL** workflow where Pi provides long-lived context and model switching, while the controller provides the missing orchestration loop:
 
 ```text
-GitHub Task → Claim → Worktree → Worker → Verify → Review → Merge → Next Task
+GitHub Task → Claim → Worktree → Observable Execution → Verify → Review → Merge → Next Task
 ```
 
 The controller stops only for an explicit reason such as an empty backlog, a blocker, a human decision, a user pause, or an exhausted run budget.
@@ -27,7 +27,10 @@ MVP implementation in progress. The deterministic Core, GitHub/Git/verification/
 - Deterministic reconciliation, not an LLM deciding whether to continue
 - GitHub Issues as task intent; Git as code truth; durable journal as execution truth
 - One active task in one isolated worktree
-- Structured worker and reviewer results
+- Worker and Reviewer as bounded Executions, not nested Subagents
+- Normalized lifecycle, tool, usage, and termination events in the durable journal
+- Explicit intervention capabilities: cancellation is supported; pause/steer are never implied
+- Structured Worker and Reviewer Results
 - Controller-owned verification evidence
 - Human gates for architecture and dangerous operations
 - Bounded autonomy through budgets, retries, and explicit stop reasons

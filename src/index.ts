@@ -33,13 +33,30 @@ export default function (pi: ExtensionAPI): void {
     },
   });
 
+  pi.registerCommand("controller-events", {
+    description: "Show recent observable Execution events (default 10, maximum 20)",
+    handler: async (args, ctx) => {
+      const requested = Number(args.trim() || 10);
+      const events = await service.executionEvents(Number.isFinite(requested) ? requested : 10, ctx);
+      ctx.ui.notify(formatExecutionEvents(events), "info");
+    },
+  });
+
   pi.registerCommand("controller-pause", {
     description: "Pause the Agent Controller after the current safe checkpoint",
     handler: async (_args, ctx) => { await service.pause(); ctx.ui.notify("Controller pause requested", "info"); },
   });
 
+  pi.registerCommand("controller-interrupt", {
+    description: "Cancel only the active Execution; retry/block behavior remains Policy-controlled",
+    handler: async (_args, ctx) => {
+      const interrupted = service.interruptExecution();
+      ctx.ui.notify(interrupted ? "Active Execution cancellation requested" : "No cancellable Execution is active", interrupted ? "warning" : "info");
+    },
+  });
+
   pi.registerCommand("controller-stop", {
-    description: "Stop the Agent Controller and cancel child work",
+    description: "Stop the Agent Controller and cancel the active Execution",
     handler: async (_args, ctx) => { await service.stop(); ctx.ui.notify("Controller stop requested", "warning"); },
   });
 
@@ -74,6 +91,17 @@ export default function (pi: ExtensionAPI): void {
   });
 
   pi.registerTool({
+    name: "controller_execution_events",
+    label: "Controller Execution Events",
+    description: "Read recent normalized lifecycle, tool, usage, and termination events from Controller Executions.",
+    parameters: Type.Object({ limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })) }),
+    async execute(_toolCallId: string, params: { limit?: number }, _signal: AbortSignal, _onUpdate: unknown, ctx: ExtensionContext) {
+      const events = await service.executionEvents(params.limit ?? 10, ctx);
+      return { content: [{ type: "text", text: formatExecutionEvents(events) }], details: { events } };
+    },
+  });
+
+  pi.registerTool({
     name: "controller_start",
     label: "Controller Start",
     description: "Start or dry-run the deterministic GitHub-to-Pi Agent Controller workflow. Use dryRun before autonomous execution when requested.",
@@ -94,4 +122,13 @@ export default function (pi: ExtensionAPI): void {
     await service.shutdown();
     ctx.ui.setStatus("agent-controller", undefined);
   });
+}
+
+function formatExecutionEvents(events: Array<{ at: number; reason?: string; data?: Record<string, unknown> }>): string {
+  if (events.length === 0) return "No Execution events recorded";
+  return events.map((entry) => {
+    const event = entry.data?.event as { role?: string; type?: string; summary?: string } | undefined;
+    const timestamp = new Date(entry.at).toISOString();
+    return `${timestamp} ${event?.role ?? "execution"}/${event?.type ?? "event"}: ${event?.summary ?? entry.reason ?? ""}`;
+  }).join("\n");
 }

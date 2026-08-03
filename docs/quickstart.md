@@ -56,12 +56,15 @@ Inside the target Git checkout:
 /controller-start --dry-run
 /controller-start
 /controller-status
+/controller-events 10
 ```
+
+`/controller-status` includes the active Execution identity, Role, state, and supported controls. `/controller-events` shows recent normalized lifecycle, tool, usage, completion, failure, and cancellation events from the durable Run Journal.
 
 The Controller performs this loop without another prompt:
 
 ```text
-claim Issue → create Worktree → run Worker → run Verification → run Reviewer → merge → close/update Issue → claim next Issue
+claim Issue → create Worktree → run observable Worker Execution → run Verification → run Reviewer Execution → merge → close/update Issue → claim next Issue
 ```
 
 Useful controls:
@@ -69,6 +72,7 @@ Useful controls:
 ```text
 /controller-pause
 /controller-resume
+/controller-interrupt
 /controller-stop
 /controller-approve <gate-id> allow
 /controller-approve <gate-id> reject
@@ -82,5 +86,8 @@ A run stops with an explicit reason such as `BACKLOG_EMPTY`, `HUMAN_DECISION_REQ
 - Repository-local agent prompts are untrusted and require a trusted Pi project.
 - Human approval is required for guarded content or Policy-disabled auto-merge.
 - Non-interactive mode fails closed when a Human Gate is required.
+- Worker and Reviewer work is modeled as a bounded Execution, not a nested Subagent.
+- The Pi process Runtime declares `cancel` support. `/controller-interrupt` cancels only the active Execution; retry or blocking remains Policy-controlled. `/controller-stop` cancels it and terminates the Run.
+- Mid-Execution `pause` and `steer` are currently unsupported; graceful Run pause takes effect at a safe checkpoint.
 - Failed Workspaces are retained by default; inspect their evidence before cleanup.
 - Runtime Journal and lease data are stored under the repository's Git metadata, not committed to the project.

@@ -1,5 +1,6 @@
 export const JOURNAL_SCHEMA_VERSION = 1 as const;
 export const POLICY_SCHEMA_VERSION = 1 as const;
+export const EXECUTION_EVENT_SCHEMA_VERSION = 1 as const;
 
 export type TaskState =
   | "READY"
@@ -28,7 +29,43 @@ export type StopReason =
   | "LEASE_UNAVAILABLE"
   | "INTERNAL_FAILURE";
 
-export type AgentRole = "worker" | "reviewer" | "architect";
+export type ExecutionRole = "worker" | "reviewer" | "architect";
+
+export interface ExecutionCapabilities {
+  cancel: boolean;
+  pause: boolean;
+  steer: boolean;
+}
+
+export type ExecutionEventType =
+  | "started"
+  | "assistant_message"
+  | "tool_call"
+  | "tool_result"
+  | "usage"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+export interface ExecutionEvent {
+  schemaVersion: typeof EXECUTION_EVENT_SCHEMA_VERSION;
+  executionId: string;
+  at: number;
+  role: ExecutionRole;
+  type: ExecutionEventType;
+  summary: string;
+  details?: Record<string, unknown>;
+}
+
+export interface ActiveExecution {
+  id: string;
+  role: ExecutionRole;
+  state: "STARTING" | "RUNNING";
+  startedAt: number;
+  updatedAt: number;
+  capabilities: ExecutionCapabilities;
+  lastEvent?: Pick<ExecutionEvent, "type" | "summary" | "at">;
+}
 
 export interface Task {
   number: number;
@@ -52,7 +89,7 @@ export interface VerificationCommand {
   thresholds?: Record<string, { min?: number; max?: number }>;
 }
 
-export interface AgentRolePolicy {
+export interface RolePolicy {
   model: string;
   tools: string[];
   timeoutMs: number;
@@ -81,7 +118,7 @@ export interface ControllerPolicy {
   maxCost?: number;
   pollIntervalMs: number;
   verification: VerificationCommand[];
-  roles: Record<AgentRole, AgentRolePolicy>;
+  roles: Record<ExecutionRole, RolePolicy>;
   protectedBranches: string[];
   guardedPathPatterns: string[];
   cleanupOnSuccess: boolean;
@@ -103,7 +140,7 @@ export interface RunBudgetUsage {
   attempts: number;
   tokens: number;
   cost: number;
-  roleUsage: Record<AgentRole, RoleUsage>;
+  roleUsage: Record<ExecutionRole, RoleUsage>;
   startedAt: number;
 }
 
@@ -115,6 +152,7 @@ export interface Run {
   currentTask?: number;
   stopReason?: StopReason;
   gate?: HumanGate;
+  activeExecution?: ActiveExecution;
   usage: RunBudgetUsage;
   startedAt: number;
   updatedAt: number;
@@ -129,10 +167,11 @@ export interface Workspace {
 
 export interface Handoff {
   schemaVersion: 1;
+  executionId: string;
   runId: string;
   task: Task;
   workspace: Workspace;
-  role: AgentRole;
+  role: ExecutionRole;
   model: string;
   tools: string[];
   constraints: string[];
@@ -209,6 +248,7 @@ export type JournalEventType =
   | "WORKSPACE_CREATING"
   | "WORKSPACE_CREATED"
   | "EXECUTION_STARTED"
+  | "EXECUTION_PROGRESS"
   | "EXECUTION_FINISHED"
   | "VERIFICATION_FINISHED"
   | "REVIEW_FINISHED"
@@ -254,12 +294,18 @@ export interface WorkspaceManager {
   find?(task: Task, policy: ControllerPolicy): Promise<Workspace | undefined>;
 }
 
-export interface AgentRuntime {
+export interface ExecutionRequest {
+  id: string;
+  role: ExecutionRole;
+  handoff: Handoff;
+}
+
+export interface ExecutionRuntime {
+  readonly capabilities: ExecutionCapabilities;
   execute(
-    role: AgentRole,
-    handoff: Handoff,
+    request: ExecutionRequest,
     signal: AbortSignal,
-    onUpdate?: (text: string) => void,
+    onEvent?: (event: ExecutionEvent) => void | Promise<void>,
   ): Promise<WorkerResult | ReviewResult>;
 }
 
@@ -280,7 +326,7 @@ export interface RepositoryLease {
 export interface ControllerAdapters {
   tasks: TaskTracker;
   workspaces: WorkspaceManager;
-  agents: AgentRuntime;
+  executions: ExecutionRuntime;
   verification: VerificationRunner;
   journal: JournalStore;
   lease: RepositoryLease;

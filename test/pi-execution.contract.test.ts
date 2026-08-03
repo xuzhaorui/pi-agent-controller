@@ -3,11 +3,11 @@ import assert from "node:assert/strict";
 import { mkdtemp, writeFile, chmod, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import type { Handoff, Task, Usage, Workspace } from "../src/domain.js";
-import { PiProcessAgentRuntime } from "../src/adapters/pi-agent.js";
+import type { ExecutionEvent, ExecutionRequest, Handoff, Task, Usage, Workspace } from "../src/domain.js";
+import { PiProcessExecutionRuntime } from "../src/adapters/pi-execution.js";
 
 // These tests exercise the real Pi JSON event-stream contract that
-// PiProcessAgentRuntime parses. The event shapes below were captured from an
+// PiProcessExecutionRuntime parses. The event shapes below were captured from an
 // actual `pi --mode json -p --no-session` invocation and document the wire
 // format the adapter must keep working against.
 
@@ -57,7 +57,7 @@ const WORKER_JSON = JSON.stringify({
   artifacts: [],
 });
 
-async function setup(scriptBody: string): Promise<{ runtime: PiProcessAgentRuntime; handoff: Handoff; cleanup: () => Promise<void> }> {
+async function setup(scriptBody: string): Promise<{ runtime: PiProcessExecutionRuntime; request: ExecutionRequest; cleanup: () => Promise<void> }> {
   const dir = await mkdtemp(join(tmpdir(), "pi-contract-"));
   const command = join(dir, "fake-pi");
   const events = join(dir, "events.jsonl");
@@ -67,16 +67,16 @@ async function setup(scriptBody: string): Promise<{ runtime: PiProcessAgentRunti
   const workspacePath = await mkdtemp(join(tmpdir(), "pi-ws-"));
   const workspace: Workspace = { taskNumber: 1, path: workspacePath, branch: "agent/task-1", baseBranch: "main" };
   const task: Task = { number: 1, title: "t", body: "", labels: ["ready-for-agent"], priority: 1, state: "READY", acceptanceCriteria: ["AC"], dependencies: [] };
-  const handoff: Handoff = { schemaVersion: 1, runId: "run-1", task, workspace, role: "worker", model: "glm-5.2", tools: ["read", "bash", "edit", "write"], constraints: [], verification: [], outputContract: "WorkerResult" };
-  const runtime = new PiProcessAgentRuntime({ command, environment: { FAKE_PI_EVENTS: events } });
+  const handoff: Handoff = { schemaVersion: 1, executionId: "execution-1", runId: "run-1", task, workspace, role: "worker", model: "glm-5.2", tools: ["read", "bash", "edit", "write"], constraints: [], verification: [], outputContract: "WorkerResult" };
+  const runtime = new PiProcessExecutionRuntime({ command, environment: { FAKE_PI_EVENTS: events } });
   const cleanup = async () => { await rm(dir, { recursive: true, force: true }); await rm(workspacePath, { recursive: true, force: true }); };
-  return { runtime, handoff, cleanup };
+  return { runtime, request: { id: handoff.executionId, role: handoff.role, handoff }, cleanup };
 }
 
 test("parses a Worker Result from the real Pi JSON event stream and normalises object-cost usage", async () => {
-  const { runtime, handoff, cleanup } = await setup(stream([{ text: WORKER_JSON, usage: PI_USAGE }]));
+  const { runtime, request, cleanup } = await setup(stream([{ text: WORKER_JSON, usage: PI_USAGE }]));
   try {
-    const result = await runtime.execute("worker", handoff, new AbortController().signal);
+    const result = await runtime.execute(request, new AbortController().signal);
     assert.equal(result.schemaVersion, 1);
     assert.equal((result as { outcome?: string }).outcome, "completed");
     assert.equal((result as { commit?: string }).commit, "abc123");
@@ -89,10 +89,29 @@ test("parses a Worker Result from the real Pi JSON event stream and normalises o
   } finally { await cleanup(); }
 });
 
-test("treats Pi message.usage as authoritative, ignoring the model's self-reported usage", async () => {
-  const { runtime, handoff, cleanup } = await setup(stream([{ text: WORKER_JSON, usage: PI_USAGE }]));
+test("normalises Pi lifecycle and tool activity into observable Execution Events", async () => {
+  const toolEvents = [
+    `{"type":"tool_execution_start","toolCallId":"call-1","toolName":"read","args":{"path":"README.md"}}`,
+    `{"type":"tool_execution_end","toolCallId":"call-1","toolName":"read","result":{"content":[{"type":"text","text":"ok"}]},"isError":false}`,
+  ].join("\n");
+  const eventStream = stream([{ text: WORKER_JSON, usage: PI_USAGE }]).replace(`{"type":"turn_start"}`, `{"type":"turn_start"}\n${toolEvents}`);
+  const { runtime, request, cleanup } = await setup(eventStream);
+  const observed: ExecutionEvent[] = [];
   try {
-    const result = await runtime.execute("worker", handoff, new AbortController().signal);
+    await runtime.execute(request, new AbortController().signal, (event) => { observed.push(event); });
+    assert.deepEqual(runtime.capabilities, { cancel: true, pause: false, steer: false });
+    assert.ok(observed.some((event) => event.type === "started"));
+    assert.ok(observed.some((event) => event.type === "tool_call" && event.details?.toolName === "read"));
+    assert.ok(observed.some((event) => event.type === "tool_result"));
+    assert.ok(observed.some((event) => event.type === "usage"));
+    assert.equal(observed.at(-1)?.type, "completed");
+  } finally { await cleanup(); }
+});
+
+test("treats Pi message.usage as authoritative, ignoring the model's self-reported usage", async () => {
+  const { runtime, request, cleanup } = await setup(stream([{ text: WORKER_JSON, usage: PI_USAGE }]));
+  try {
+    const result = await runtime.execute(request, new AbortController().signal);
     assert.equal(result.usage.input, 442);
     assert.equal(result.usage.cost, 0.003);
     assert.notEqual(result.usage.cost, 999);
@@ -101,12 +120,12 @@ test("treats Pi message.usage as authoritative, ignoring the model's self-report
 
 test("accumulates usage across multiple assistant turns", async () => {
   const turn2 = { ...PI_USAGE, input: 100, totalTokens: 120, cost: { ...PI_USAGE.cost, total: 0.004 } };
-  const { runtime, handoff, cleanup } = await setup(stream([
+  const { runtime, request, cleanup } = await setup(stream([
     { text: "", usage: PI_USAGE },
     { text: WORKER_JSON, usage: turn2 },
   ]));
   try {
-    const result = await runtime.execute("worker", handoff, new AbortController().signal);
+    const result = await runtime.execute(request, new AbortController().signal);
     assert.equal(result.usage.input, 542);
     assert.equal(result.usage.totalTokens, 574);
     assert.equal(result.usage.cost, 0.007);
@@ -115,16 +134,16 @@ test("accumulates usage across multiple assistant turns", async () => {
 });
 
 test("fails when the assistant emits no Result text", async () => {
-  const { runtime, handoff, cleanup } = await setup(stream([{ text: "", usage: PI_USAGE }]));
+  const { runtime, request, cleanup } = await setup(stream([{ text: "", usage: PI_USAGE }]));
   try {
-    await assert.rejects(runtime.execute("worker", handoff, new AbortController().signal), /did not return a JSON Result/);
+    await assert.rejects(runtime.execute(request, new AbortController().signal), /did not return a JSON Result/);
   } finally { await cleanup(); }
 });
 
 test("fails on malformed Result JSON", async () => {
-  const { runtime, handoff, cleanup } = await setup(stream([{ text: "not json at all", usage: PI_USAGE }]));
+  const { runtime, request, cleanup } = await setup(stream([{ text: "not json at all", usage: PI_USAGE }]));
   try {
-    await assert.rejects(runtime.execute("worker", handoff, new AbortController().signal), /malformed Result JSON/);
+    await assert.rejects(runtime.execute(request, new AbortController().signal), /malformed Result JSON/);
   } finally { await cleanup(); }
 });
 
@@ -136,10 +155,10 @@ test("fails on non-zero process exit", async () => {
   const workspacePath = await mkdtemp(join(tmpdir(), "pi-ws-"));
   const workspace: Workspace = { taskNumber: 1, path: workspacePath, branch: "agent/task-1", baseBranch: "main" };
   const task: Task = { number: 1, title: "t", body: "", labels: [], priority: 1, state: "READY", acceptanceCriteria: [], dependencies: [] };
-  const handoff: Handoff = { schemaVersion: 1, runId: "run-1", task, workspace, role: "worker", model: "m", tools: [], constraints: [], verification: [], outputContract: "WorkerResult" };
-  const runtime = new PiProcessAgentRuntime({ command });
+  const handoff: Handoff = { schemaVersion: 1, executionId: "execution-1", runId: "run-1", task, workspace, role: "worker", model: "m", tools: [], constraints: [], verification: [], outputContract: "WorkerResult" };
+  const runtime = new PiProcessExecutionRuntime({ command });
   try {
-    await assert.rejects(runtime.execute("worker", handoff, new AbortController().signal), /Agent process failed/);
+    await assert.rejects(runtime.execute({ id: handoff.executionId, role: handoff.role, handoff }, new AbortController().signal), /Execution process failed/);
   } finally {
     await rm(dir, { recursive: true, force: true });
     await rm(workspacePath, { recursive: true, force: true });
@@ -154,10 +173,10 @@ test("propagates AbortSignal by terminating the subprocess", async () => {
   const workspacePath = await mkdtemp(join(tmpdir(), "pi-ws-"));
   const workspace: Workspace = { taskNumber: 1, path: workspacePath, branch: "agent/task-1", baseBranch: "main" };
   const task: Task = { number: 1, title: "t", body: "", labels: [], priority: 1, state: "READY", acceptanceCriteria: [], dependencies: [] };
-  const handoff: Handoff = { schemaVersion: 1, runId: "run-1", task, workspace, role: "worker", model: "m", tools: [], constraints: [], verification: [], outputContract: "WorkerResult" };
-  const runtime = new PiProcessAgentRuntime({ command });
+  const handoff: Handoff = { schemaVersion: 1, executionId: "execution-1", runId: "run-1", task, workspace, role: "worker", model: "m", tools: [], constraints: [], verification: [], outputContract: "WorkerResult" };
+  const runtime = new PiProcessExecutionRuntime({ command });
   const controller = new AbortController();
-  const pending = assert.rejects(runtime.execute("worker", handoff, controller.signal), /cancelled/);
+  const pending = assert.rejects(runtime.execute({ id: handoff.executionId, role: handoff.role, handoff }, controller.signal), /cancelled/);
   controller.abort();
   await pending;
   await rm(dir, { recursive: true, force: true });

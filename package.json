@@ -10,7 +10,7 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "build": "tsc",
+    "build": "node --input-type=module -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true });\" && tsc",
     "test": "npm run build && node --test dist/test/*.test.js",
     "check": "npm run typecheck && npm test"
   },

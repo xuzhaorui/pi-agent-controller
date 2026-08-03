@@ -1,11 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  type AgentRuntime,
   type ControllerAdapters,
+  type ExecutionRuntime,
   type ControllerPolicy,
   type Evidence,
-  type Handoff,
   type JournalEvent,
   type JournalStore,
   type RepositoryLease,
@@ -99,10 +98,13 @@ class FakeVerification implements VerificationRunner {
   }
 }
 
-class FakeAgents implements AgentRuntime {
+class FakeExecutions implements ExecutionRuntime {
+  readonly capabilities = { cancel: true, pause: false, steer: false };
   workers = 0;
   reviewers = 0;
-  async execute(role: "worker" | "reviewer", _handoff: Handoff, _signal: AbortSignal, _update?: (text: string) => void): Promise<WorkerResult | ReviewResult> {
+  async execute(request: Parameters<ExecutionRuntime["execute"]>[0], _signal: AbortSignal, onEvent?: Parameters<ExecutionRuntime["execute"]>[2]): Promise<WorkerResult | ReviewResult> {
+    const { id, role } = request;
+    await onEvent?.({ schemaVersion: 1, executionId: id, at: 1_000, role, type: "started", summary: `${role} started` });
     if (role === "worker") {
       this.workers += 1;
       return {
@@ -119,15 +121,15 @@ class FakeAgents implements AgentRuntime {
   }
 }
 
-function adapters(tasks: Task[]): { adapters: ControllerAdapters; tracker: FakeTasks; workspace: FakeWorkspace; verification: FakeVerification; agents: FakeAgents; journal: MemoryJournal } {
+function adapters(tasks: Task[]): { adapters: ControllerAdapters; tracker: FakeTasks; workspace: FakeWorkspace; verification: FakeVerification; executions: FakeExecutions; journal: MemoryJournal } {
   const tracker = new FakeTasks(tasks);
   const workspace = new FakeWorkspace();
   const verification = new FakeVerification();
-  const agents = new FakeAgents();
+  const executions = new FakeExecutions();
   const journal = new MemoryJournal();
   return {
-    tracker, workspace, verification, agents, journal,
-    adapters: { tasks: tracker, workspaces: workspace, verification, agents, journal, lease: new MemoryLease(), now: () => 1_000 },
+    tracker, workspace, verification, executions, journal,
+    adapters: { tasks: tracker, workspaces: workspace, verification, executions, journal, lease: new MemoryLease(), now: () => 1_000 },
   };
 }
 
@@ -142,18 +144,73 @@ test("runs eligible tasks in deterministic order and immediately reconciles the 
   assert.deepEqual(setup.workspace.created, [1, 2]);
   assert.deepEqual(setup.workspace.merged, [1, 2]);
   assert.equal(setup.verification.calls, 2);
-  assert.equal(setup.agents.workers, 2);
-  assert.equal(setup.agents.reviewers, 2);
+  assert.equal(setup.executions.workers, 2);
+  assert.equal(setup.executions.reviewers, 2);
+  assert.ok(setup.journal.events.some((event) => event.type === "EXECUTION_PROGRESS" && event.data?.event));
   assert.ok(setup.journal.events.some((event) => event.type === "TASK_COMPLETED" && event.taskNumber === 2));
+});
+
+test("redacts secrets from persisted Execution Events", async () => {
+  const setup = adapters([task(1, 1)]);
+  const original = setup.executions.execute.bind(setup.executions);
+  setup.executions.execute = async (request, signal, onEvent) => {
+    await onEvent?.({
+      schemaVersion: 1,
+      executionId: request.id,
+      at: 1_000,
+      role: request.role,
+      type: "tool_call",
+      summary: "token=TOPSECRET",
+      details: { inputPreview: "password=TOPSECRET" },
+    });
+    return original(request, signal, onEvent);
+  };
+  const customPolicy = policy();
+  customPolicy.secrets = ["TOPSECRET"];
+  const core = new ControllerCore("/repo", customPolicy, setup.adapters);
+
+  await core.run(new AbortController().signal);
+
+  assert.equal(JSON.stringify(setup.journal.events).includes("TOPSECRET"), false);
+  assert.ok(JSON.stringify(setup.journal.events).includes("[REDACTED]"));
+});
+
+test("exposes and interrupts the active Execution without a hidden Agent protocol", async () => {
+  const setup = adapters([task(1, 1)]);
+  let markStarted: (() => void) | undefined;
+  const started = new Promise<void>((resolve) => { markStarted = resolve; });
+  setup.executions.execute = async (request, signal, onEvent) => {
+    await onEvent?.({ schemaVersion: 1, executionId: request.id, at: 1_000, role: request.role, type: "started", summary: "execution started" });
+    markStarted?.();
+    return await new Promise<never>((_resolve, reject) => {
+      signal.addEventListener("abort", async () => {
+        await onEvent?.({ schemaVersion: 1, executionId: request.id, at: 1_001, role: request.role, type: "cancelled", summary: "execution cancelled" });
+        reject(new Error("Execution process was cancelled"));
+      }, { once: true });
+    });
+  };
+  const customPolicy = policy();
+  customPolicy.maxAttemptsPerTask = 1;
+  const core = new ControllerCore("/repo", customPolicy, setup.adapters);
+  const pending = core.run(new AbortController().signal);
+
+  await started;
+  assert.equal(core.snapshot.activeExecution?.role, "worker");
+  assert.deepEqual(core.snapshot.activeExecution?.capabilities, { cancel: true, pause: false, steer: false });
+  assert.equal(core.interruptExecution(), true);
+
+  const result = await pending;
+  assert.equal(result.run.stopReason, "BLOCKED");
+  assert.ok(core.executionEvents.some((event) => (event.data?.event as { type?: string } | undefined)?.type === "cancelled"));
 });
 
 test("does not merge when review requests changes", async () => {
   const setup = adapters([task(1, 1)]);
-  const original = setup.agents.execute.bind(setup.agents);
+  const original = setup.executions.execute.bind(setup.executions);
   let reviewCount = 0;
-  setup.agents.execute = async (role, handoff, signal, update) => {
-    const result = await original(role, handoff, signal, update);
-    if (role === "reviewer" && reviewCount++ === 0) return { ...(result as ReviewResult), disposition: "changes_requested", findings: ["fix race"] };
+  setup.executions.execute = async (request, signal, onEvent) => {
+    const result = await original(request, signal, onEvent);
+    if (request.role === "reviewer" && reviewCount++ === 0) return { ...(result as ReviewResult), disposition: "changes_requested", findings: ["fix race"] };
     return result;
   };
   const customPolicy = policy();
@@ -209,7 +266,7 @@ test("resumes a merge Human Gate without reclaiming or re-running the Task", asy
   assert.equal(completed.run.stopReason, "BACKLOG_EMPTY");
   assert.deepEqual(setup.tracker.claimed, [1]);
   assert.deepEqual(setup.workspace.merged, [1]);
-  assert.equal(setup.agents.workers, 1);
+  assert.equal(setup.executions.workers, 1);
 });
 
 test("resumes from Verification Evidence without rerunning completed Worker work", async () => {
@@ -230,8 +287,8 @@ test("resumes from Verification Evidence without rerunning completed Worker work
   assert.ok(core);
   const result = await core.run(new AbortController().signal);
   assert.equal(result.run.stopReason, "BACKLOG_EMPTY");
-  assert.equal(setup.agents.workers, 0);
-  assert.equal(setup.agents.reviewers, 1);
+  assert.equal(setup.executions.workers, 0);
+  assert.equal(setup.executions.reviewers, 1);
   assert.equal(setup.verification.calls, 0);
 });
 
@@ -300,7 +357,7 @@ test("recovers a pending merge Human Gate without rerunning the Worker", async (
   assert.equal(result.run.stopReason, "BACKLOG_EMPTY");
   assert.deepEqual(setup.tracker.claimed, []);
   assert.deepEqual(setup.workspace.merged, [1]);
-  assert.equal(setup.agents.workers, 0);
+  assert.equal(setup.executions.workers, 0);
 });
 
 test("recovers a paused Run from the journal", async () => {

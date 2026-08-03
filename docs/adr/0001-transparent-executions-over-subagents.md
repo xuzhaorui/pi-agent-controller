@@ -1,0 +1,3 @@
+# Model delegated work as transparent Executions, not Subagents
+
+The Controller models Worker and Reviewer activity as bounded Executions with explicit Handoffs, Results, normalized observable events, declared intervention capabilities, and durable journal records. It deliberately avoids parent/child Agent classes, recursive Agent nesting, and private coordination protocols: the initial Pi process adapter supports cancellation and reports that pause and steer are unsupported, while future runtimes may add controls only through the same explicit capability contract. This keeps deterministic reconciliation independent of any agent framework and makes unsupported intervention impossible to imply accidentally.
